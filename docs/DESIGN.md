@@ -268,6 +268,12 @@ Future intended usage may resemble:
 wget <URL> install.lua
 install
 
+The current Milestone 2 development installer uses the repository as a local
+payload: it reads `src/startup.lua`, `src/dickos/system/init.lua`, and
+`src/dickos/system/recovery.lua` beside `install.lua`, then writes them to their
+installed paths after confirmation. A single-file download/bootstrap transport
+is not implemented yet and must not be confused with DickPkg or DickRepo.
+
 Installer flow:
 
 preflight
@@ -499,6 +505,34 @@ Stage-0 must not contain ordinary OS functionality.
 
 It should change rarely.
 
+## 0.1 boot contract
+
+CraftOS remains the runtime and substrate beneath DICK/OS. DICK/OS does not
+replace the CC:T runtime or attempt to preserve a running Lua stack across
+power loss, reboot, server restart, or a chunk unload which causes a fresh
+computer startup.
+
+DICK/OS boot control begins only after CraftOS reaches its local startup phase.
+CraftOS runs `/rom/autorun` earlier, and datapacks or other mods may extend that
+directory. Stage-0 cannot supervise code which the platform executes before
+`/startup.lua`; this is a platform limitation, not a failure which Recovery can
+intercept.
+
+Once CraftOS reaches local startup, every cold or fresh start creates a new
+execution state. CraftOS runs the installed `/startup.lua`, Stage-0 loads init,
+and persistent DICK/OS state is read again from `/dickos/etc` and `/dickos/var`
+as those subsystems become available.
+
+If CraftOS reaches local startup and `/startup.lua` exists and remains
+syntactically executable, normal startup must lead either to the DICK/OS
+environment or to DICK/OS Recovery. An unexpected init return, init crash, or
+missing init must not casually expose the CraftOS prompt.
+
+DICK/OS cannot guarantee this contract if `/startup.lua` itself is deleted or
+damaged so severely that CraftOS cannot execute it. This is an unavoidable
+limit of running on top of CraftOS's standard startup mechanism, not a recovery
+case which already-running DICK/OS code can intercept.
+
 ---
 
 # 14. Ctrl+T behaviour
@@ -526,6 +560,11 @@ CraftOS
 The exact termination policy may differ depending on which component was
 terminated, but DICK/OS must remain in control of the machine.
 
+For the minimal 0.1 bootstrap, init receives the CC:T `terminate` event and
+returns an explicit restart result to Stage-0. Stage-0 then starts a fresh init
+attempt through its existing supervisor loop. A real Lua error and an
+unexpected normal return are different failure states and enter Recovery.
+
 ---
 
 # 15. Startup policy
@@ -538,6 +577,12 @@ CraftOS must remain available as an explicit recovery environment.
 Recovery access is intentional.
 
 Accidentally escaping into CraftOS is not.
+
+The installer persists `shell.allow_startup = true` and
+`shell.allow_disk_startup = false`. Local Stage-0 therefore owns the ordinary
+boot path, and a disk startup program cannot run before it. Recovery may still
+end Stage-0 after an explicit CraftOS rescue selection; the next reboot or
+fresh power-on starts DICK/OS again.
 
 ---
 

@@ -7,16 +7,25 @@
 local VERSION = "0.1.0-unstable"
 local ROOT_PATH = "/"
 local INSTALL_PATH = "/dickos"
+local STARTUP_PATH = "/startup.lua"
+local ALTERNATE_STARTUP_PATH = "/startup"
+
+local LOCAL_STARTUP_SETTING = "shell.allow_startup"
+local DISK_STARTUP_SETTING = "shell.allow_disk_startup"
 
 local MIB = 1024 * 1024
 local MINIMUM_CAPACITY = 4 * MIB
 local RECOMMENDED_CAPACITY = 16 * MIB
 
 -- These flags let the final error handler distinguish a preflight failure
--- from an unexpected error during deployment. Only a directory tree which
--- this run started creating may be removed by the rollback code.
+-- from an unexpected error during deployment. Ownership is tracked separately
+-- for `/dickos`, `/startup.lua`, and persistent boot settings so rollback never
+-- removes or replaces state which existed before this installer run.
 local deploymentStarted = false
 local deploymentFinished = false
+local startupCreatedByInstaller = false
+local bootSettingsChanged = false
+local bootSettingsSnapshot = nil
 
 -- CC:Tweaked's `term` API controls the computer's text terminal. Status
 -- colours are optional presentation: a non-colour terminal must still be able
@@ -190,6 +199,24 @@ local function validateStorage()
     return true
 end
 
+-- Find any local startup path which would conflict with DICK/OS Stage-0.
+-- CraftOS runs an extensionless `/startup` file or `/startup.lua`, followed by
+-- programs inside a `/startup` directory. A directory therefore conflicts too:
+-- after an explicit Stage-0 rescue return, its programs could run before the
+-- CraftOS shell appears. Refusing either existing path keeps that transition
+-- predictable without attempting an unsafe merge, backup, or startup chain.
+local function findStartupConflict()
+    if fs.exists(STARTUP_PATH) then
+        return STARTUP_PATH
+    end
+
+    if fs.exists(ALTERNATE_STARTUP_PATH) then
+        return ALTERNATE_STARTUP_PATH
+    end
+
+    return nil
+end
+
 -- Hostnames use a deliberately small portable character set. Lua patterns
 -- are a lightweight matching language: `^` and `$` anchor the whole value,
 -- while `[A-Za-z0-9-]+` means one or more allowed ASCII characters.
@@ -327,6 +354,117 @@ local function confirmInstallation()
     return answer == "y" or answer == "yes"
 end
 
+-- Read one repository source file into memory during preflight.
+--
+-- This milestone deliberately uses a small local payload instead of inventing
+-- a downloader or package manager. `shell.getRunningProgram` identifies the
+-- installer file being executed, and the payload is expected in its sibling
+-- `src` directory. Reading the source before confirmation is safe because
+-- `fs.open` with mode "r" does not change the filesystem.
+local function readSourceFile(path)
+    local file, openError = fs.open(path, "r")
+
+    if file == nil then
+        return nil, "Unable to open source file " .. path .. ": " ..
+            tostring(openError)
+    end
+
+    local readSucceeded, contentsOrError = pcall(file.readAll)
+    local closeSucceeded, closeError = pcall(file.close)
+
+    if not readSucceeded then
+        return nil, "Unable to read source file " .. path .. ": " ..
+            tostring(contentsOrError)
+    end
+
+    if not closeSucceeded then
+        return nil, "Unable to close source file " .. path .. ": " ..
+            tostring(closeError)
+    end
+
+    if contentsOrError == nil or contentsOrError == "" then
+        return nil, "Source file is empty: " .. path
+    end
+
+    return contentsOrError, nil
+end
+
+-- Load the three real Milestone 2 programs into a small payload table.
+--
+-- Each entry maps a repository source path to its final installed path. The
+-- ordering is intentional: init and recovery are deployed before startup.lua,
+-- so the boot entry point is the last program file exposed on disk. No generic
+-- package/dependency framework is needed for three fixed bootstrap files.
+local function loadInstallationPayload()
+    local runningProgram = shell.getRunningProgram()
+    local installerDirectory = fs.getDir(runningProgram)
+    local sourceRoot = fs.combine(installerDirectory, "src")
+    local payload = {
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/system/init.lua"),
+            destinationPath = "/dickos/system/init.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/system/recovery.lua"),
+            destinationPath = "/dickos/system/recovery.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "startup.lua"),
+            destinationPath = STARTUP_PATH,
+        },
+    }
+
+    for _, payloadFile in ipairs(payload) do
+        local contents, readError = readSourceFile(payloadFile.sourcePath)
+
+        if contents == nil then
+            return nil, readError
+        end
+
+        payloadFile.contents = contents
+    end
+
+    return payload, nil
+end
+
+-- Capture whether each boot setting has an explicit value, not merely its
+-- effective default. `settings.getDetails` reports this with its boolean
+-- `changed` field. Its `value` field may contain either an explicit value or a
+-- definition's default, so checking value against nil would lose that crucial
+-- distinction. Remembering `changed` lets rollback call `settings.unset`
+-- instead of permanently writing what used to be only a default.
+local function captureBootSettings()
+    local settingNames = {
+        LOCAL_STARTUP_SETTING,
+        DISK_STARTUP_SETTING,
+    }
+    local snapshot = {}
+
+    for _, settingName in ipairs(settingNames) do
+        local detailsCallSucceeded, detailsOrError = pcall(
+            settings.getDetails,
+            settingName
+        )
+
+        if not detailsCallSucceeded then
+            return nil, "Unable to inspect setting " .. settingName .. ": " ..
+                tostring(detailsOrError)
+        end
+
+        if type(detailsOrError) ~= "table" then
+            return nil, "Setting details were unavailable for " .. settingName
+        end
+
+        snapshot[#snapshot + 1] = {
+            name = settingName,
+            hadExplicitValue = detailsOrError.changed == true,
+            value = detailsOrError.value,
+        }
+    end
+
+    return snapshot, nil
+end
+
 -- Create the directory layout for this milestone.
 --
 -- A Lua table is used as an ordered list. `ipairs` visits its numeric entries
@@ -364,21 +502,21 @@ local function createDirectoryLayout(ownerUsername)
     return true, nil
 end
 
--- Write one metadata value followed by a newline.
+-- Write exact text to one installed file.
 --
 -- `fs.open` returns a CC:T file handle, not the file contents. A failed open
 -- returns nil plus an error message. Successful handles must be closed so
 -- buffered data is committed. Writes and closes are protected separately so
 -- the installer can report which operation failed and attempt to release the
 -- handle even after a write error.
-local function writeMetadataFile(path, contents)
+local function writeTextFile(path, contents)
     local file, openError = fs.open(path, "w")
 
     if file == nil then
         return false, "Unable to open " .. path .. ": " .. tostring(openError)
     end
 
-    local writeSucceeded, writeError = pcall(file.writeLine, contents)
+    local writeSucceeded, writeError = pcall(file.write, contents)
 
     if not writeSucceeded then
         pcall(file.close)
@@ -401,20 +539,20 @@ local function writeInitialMetadata(hostname, machineID)
     local metadataFiles = {
         {
             path = "/dickos/etc/version",
-            contents = VERSION,
+            contents = VERSION .. "\n",
         },
         {
             path = "/dickos/etc/hostname",
-            contents = hostname,
+            contents = hostname .. "\n",
         },
         {
             path = "/dickos/etc/machine-id",
-            contents = machineID,
+            contents = machineID .. "\n",
         },
     }
 
     for _, metadata in ipairs(metadataFiles) do
-        local writeSucceeded, writeError = writeMetadataFile(
+        local writeSucceeded, writeError = writeTextFile(
             metadata.path,
             metadata.contents
         )
@@ -427,23 +565,188 @@ local function writeInitialMetadata(hostname, machineID)
     return true, nil
 end
 
--- Roll back only `/dickos`, which preflight proved absent before this run began
--- deployment. Unrelated user data elsewhere on the computer is never touched.
-local function removePartialInstallation()
-    if not fs.exists(INSTALL_PATH) then
+-- Deploy the already-read source payload to its final paths.
+--
+-- The startup ownership flag is set before attempting its write. Preflight and
+-- the immediate pre-deployment recheck proved that `/startup.lua` was absent,
+-- so any partial file created by this attempt belongs to this installer and may
+-- be removed safely during rollback.
+local function writeSystemPayload(payload)
+    for _, payloadFile in ipairs(payload) do
+        if payloadFile.destinationPath == STARTUP_PATH then
+            if fs.exists(STARTUP_PATH) then
+                return false,
+                    "Refusing to overwrite a newly appeared " .. STARTUP_PATH
+            end
+
+            startupCreatedByInstaller = true
+        end
+
+        local writeSucceeded, writeError = writeTextFile(
+            payloadFile.destinationPath,
+            payloadFile.contents
+        )
+
+        if not writeSucceeded then
+            return false, writeError
+        end
+
+        if not fs.exists(payloadFile.destinationPath) then
+            return false,
+                "Installed file is missing: " .. payloadFile.destinationPath
+        end
+    end
+
+    return true, nil
+end
+
+-- Persist the CraftOS startup policy required by DICK/OS.
+--
+-- Official CC:T startup settings control two separate decisions. Local startup
+-- must remain enabled so `/startup.lua` runs, while disk startup is disabled so
+-- a disk cannot run its own startup before the local Stage-0. `settings.set`
+-- changes only the in-memory setting value and queues a setting_changed event;
+-- `settings.save` is required to write those values to `/.settings` for the
+-- next reboot or cold start.
+--
+-- CraftOS itself remains available: Recovery may explicitly return from
+-- startup.lua into the current CraftOS shell. The persistent policy only makes
+-- the next boot enter DICK/OS again.
+local function applyBootSettings()
+    bootSettingsChanged = true
+
+    local localSetSucceeded, localSetError = pcall(
+        settings.set,
+        LOCAL_STARTUP_SETTING,
+        true
+    )
+
+    if not localSetSucceeded then
+        return false, "Unable to enable local startup: " ..
+            tostring(localSetError)
+    end
+
+    local diskSetSucceeded, diskSetError = pcall(
+        settings.set,
+        DISK_STARTUP_SETTING,
+        false
+    )
+
+    if not diskSetSucceeded then
+        return false, "Unable to disable disk startup: " ..
+            tostring(diskSetError)
+    end
+
+    local saveCallSucceeded, savedOrError = pcall(settings.save)
+
+    if not saveCallSucceeded then
+        return false, "Unable to save startup settings: " ..
+            tostring(savedOrError)
+    end
+
+    if savedOrError ~= true then
+        return false, "settings.save reported that startup settings were not saved."
+    end
+
+    return true, nil
+end
+
+-- Restore every boot setting to its exact pre-install explicit/default state.
+-- The restore is attempted even when one individual operation fails, and the
+-- combined result is saved afterwards so rollback is persistent across reboot.
+local function restoreBootSettings()
+    if not bootSettingsChanged then
         return true, nil
     end
 
-    local deleteSucceeded, deleteError = pcall(fs.delete, INSTALL_PATH)
+    local restoreErrors = {}
 
-    if not deleteSucceeded then
-        return false, tostring(deleteError)
+    for _, previousSetting in ipairs(bootSettingsSnapshot) do
+        local restoreSucceeded
+        local restoreError
+
+        if previousSetting.hadExplicitValue then
+            restoreSucceeded, restoreError = pcall(
+                settings.set,
+                previousSetting.name,
+                previousSetting.value
+            )
+        else
+            restoreSucceeded, restoreError = pcall(
+                settings.unset,
+                previousSetting.name
+            )
+        end
+
+        if not restoreSucceeded then
+            restoreErrors[#restoreErrors + 1] =
+                previousSetting.name .. ": " .. tostring(restoreError)
+        end
+    end
+
+    local saveCallSucceeded, savedOrError = pcall(settings.save)
+
+    if not saveCallSucceeded then
+        restoreErrors[#restoreErrors + 1] =
+            "settings.save: " .. tostring(savedOrError)
+    elseif savedOrError ~= true then
+        restoreErrors[#restoreErrors + 1] = "settings.save returned false"
+    end
+
+    if #restoreErrors > 0 then
+        return false, table.concat(restoreErrors, "; ")
+    end
+
+    bootSettingsChanged = false
+    return true, nil
+end
+
+-- Roll back only resources which this installer owns.
+--
+-- `/dickos` was absent before deployment, so its partial tree belongs to this
+-- run. `/startup.lua` is more sensitive: it is deleted only when the ownership
+-- flag proves this run attempted to create it. Previous startup settings are
+-- restored before files are removed, and unrelated paths are never touched.
+local function rollbackPartialInstallation()
+    local rollbackErrors = {}
+    local settingsRestored, settingsRestoreError = restoreBootSettings()
+
+    if not settingsRestored then
+        rollbackErrors[#rollbackErrors + 1] =
+            "startup settings: " .. tostring(settingsRestoreError)
+    end
+
+    if startupCreatedByInstaller and fs.exists(STARTUP_PATH) then
+        local deleteSucceeded, deleteError = pcall(fs.delete, STARTUP_PATH)
+
+        if not deleteSucceeded then
+            rollbackErrors[#rollbackErrors + 1] =
+                STARTUP_PATH .. ": " .. tostring(deleteError)
+        elseif fs.exists(STARTUP_PATH) then
+            rollbackErrors[#rollbackErrors + 1] =
+                STARTUP_PATH .. ": path still exists after deletion"
+        else
+            startupCreatedByInstaller = false
+        end
     end
 
     if fs.exists(INSTALL_PATH) then
-        return false, "The path still exists after the rollback attempt."
+        local deleteSucceeded, deleteError = pcall(fs.delete, INSTALL_PATH)
+
+        if not deleteSucceeded then
+            rollbackErrors[#rollbackErrors + 1] =
+                INSTALL_PATH .. ": " .. tostring(deleteError)
+        elseif fs.exists(INSTALL_PATH) then
+            rollbackErrors[#rollbackErrors + 1] =
+                INSTALL_PATH .. ": path still exists after deletion"
+        end
     end
 
+    if #rollbackErrors > 0 then
+        return false, table.concat(rollbackErrors, "; ")
+    end
+
+    deploymentStarted = false
     return true, nil
 end
 
@@ -454,13 +757,12 @@ local function reportDeploymentFailure(message, details)
         print("       Details: " .. tostring(details))
     end
 
-    local rollbackSucceeded, rollbackError = removePartialInstallation()
+    local rollbackSucceeded, rollbackError = rollbackPartialInstallation()
 
     if rollbackSucceeded then
-        info("Partial /dickos installation removed")
-        deploymentStarted = false
+        info("Partial installation and boot settings rolled back")
     else
-        warn("Partial files may remain under /dickos.")
+        warn("Partial files or startup settings may remain.")
         print("       Rollback details: " .. tostring(rollbackError))
     end
 end
@@ -480,11 +782,14 @@ end
 
 local function printSuccess(hostname, ownerUsername, machineID)
     print()
-    print("DICK/OS base environment installed.")
+    print("DICK/OS bootstrap environment installed.")
     print()
     print("Machine ID: " .. machineID)
     print("Hostname:   " .. hostname)
     print("Owner:      " .. ownerUsername)
+    print()
+    print("Stage-0, minimal init, and Recovery are installed.")
+    print("Reboot or power on the computer to enter DICK/OS.")
     print()
     print("Authentication subsystem is not installed yet.")
     print("The supplied password was not written to disk.")
@@ -516,6 +821,37 @@ local function runInstaller()
         return
     end
 
+    local startupConflict = findStartupConflict()
+
+    if startupConflict ~= nil then
+        fail("Existing " .. startupConflict .. " detected.")
+        print("DICK/OS will not overwrite an existing startup program.")
+        print("No files were changed.")
+        return
+    end
+
+    local installationPayload, payloadError = loadInstallationPayload()
+
+    if installationPayload == nil then
+        fail("Unable to load the Milestone 2 installation payload.")
+        print("       Details: " .. tostring(payloadError))
+        print("No files were changed.")
+        return
+    end
+
+    ok("Stage-0, init, and recovery source payload available")
+
+    local capturedSettings, settingsCaptureError = captureBootSettings()
+
+    if capturedSettings == nil then
+        fail("Unable to inspect CraftOS startup settings.")
+        print("       Details: " .. tostring(settingsCaptureError))
+        print("No files were changed.")
+        return
+    end
+
+    bootSettingsSnapshot = capturedSettings
+
     print()
     setStatusColor(colors.lime)
     print("Preflight PASSED")
@@ -543,11 +879,21 @@ local function runInstaller()
         return
     end
 
-    -- Recheck immediately before the first write. This prevents an existing
-    -- path from being overwritten if filesystem state changed during setup.
+    -- Recheck both owned targets immediately before the first write. This
+    -- prevents an existing installation or startup program from being
+    -- overwritten if filesystem state changed during setup.
     if fs.exists(INSTALL_PATH) then
         print()
         fail("The /dickos path appeared before deployment could begin.")
+        print("No files were overwritten.")
+        return
+    end
+
+    startupConflict = findStartupConflict()
+
+    if startupConflict ~= nil then
+        print()
+        fail(startupConflict .. " appeared before deployment could begin.")
         print("No files were overwritten.")
         return
     end
@@ -573,8 +919,31 @@ local function runInstaller()
         return
     end
 
+    local payloadSucceeded, payloadWriteError = writeSystemPayload(
+        installationPayload
+    )
+
+    if not payloadSucceeded then
+        reportDeploymentFailure(
+            "Unable to install Stage-0, init, or recovery.",
+            payloadWriteError
+        )
+        return
+    end
+
+    local settingsSucceeded, settingsError = applyBootSettings()
+
+    if not settingsSucceeded then
+        reportDeploymentFailure(
+            "Unable to persist the DICK/OS startup policy.",
+            settingsError
+        )
+        return
+    end
+
     deploymentFinished = true
-    ok("Base filesystem and metadata installed")
+    ok("Base filesystem, boot programs, and metadata installed")
+    ok("Local startup enabled; disk startup disabled")
 
     local labelSucceeded, labelError = trySetComputerLabel(hostname)
 
@@ -601,12 +970,12 @@ if not runSucceeded then
     print("       Details: " .. tostring(unexpectedError))
 
     if deploymentStarted and not deploymentFinished then
-        local rollbackSucceeded, rollbackError = removePartialInstallation()
+        local rollbackSucceeded, rollbackError = rollbackPartialInstallation()
 
         if rollbackSucceeded then
-            info("Partial /dickos installation removed")
+            info("Partial installation and boot settings rolled back")
         else
-            warn("Partial files may remain under /dickos.")
+            warn("Partial files or startup settings may remain.")
             print("       Rollback details: " .. tostring(rollbackError))
         end
     end
