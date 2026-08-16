@@ -389,7 +389,7 @@ local function readSourceFile(path)
     return contentsOrError, nil
 end
 
--- Load the six real bootstrap source files into a small payload table.
+-- Load the fixed shell-foundation source files into a small payload table.
 --
 -- Each entry maps a repository source path to its final installed path. The
 -- ordering is intentional: normal modules and utilities are deployed before
@@ -410,6 +410,10 @@ local function loadInstallationPayload()
             destinationPath = "/dickos/system/recovery.lua",
         },
         {
+            sourcePath = fs.combine(sourceRoot, "dickos/system/shell.lua"),
+            destinationPath = "/dickos/system/shell.lua",
+        },
+        {
             sourcePath = fs.combine(sourceRoot, "dickos/lib/log.lua"),
             destinationPath = "/dickos/lib/log.lua",
         },
@@ -420,6 +424,50 @@ local function loadInstallationPayload()
         {
             sourcePath = fs.combine(sourceRoot, "dickos/bin/dicklog.lua"),
             destinationPath = "/dickos/bin/dicklog.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/ls.lua"),
+            destinationPath = "/dickos/bin/ls.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/cat.lua"),
+            destinationPath = "/dickos/bin/cat.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/echo.lua"),
+            destinationPath = "/dickos/bin/echo.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/edit.lua"),
+            destinationPath = "/dickos/bin/edit.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/hostname.lua"),
+            destinationPath = "/dickos/bin/hostname.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/uname.lua"),
+            destinationPath = "/dickos/bin/uname.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/uptime.lua"),
+            destinationPath = "/dickos/bin/uptime.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/df.lua"),
+            destinationPath = "/dickos/bin/df.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/status.lua"),
+            destinationPath = "/dickos/bin/status.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/reboot.lua"),
+            destinationPath = "/dickos/bin/reboot.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/shutdown.lua"),
+            destinationPath = "/dickos/bin/shutdown.lua",
         },
         {
             sourcePath = fs.combine(sourceRoot, "startup.lua"),
@@ -486,6 +534,11 @@ end
 -- directories too. Each call is protected and then verified because failure
 -- of any directory is fatal to this installation.
 local function createDirectoryLayout(ownerUsername)
+    -- The requested owner directory preserves the tested installer layout.
+    -- Because no account metadata exists yet, the interactive milestone also
+    -- needs a separate documented bootstrap home. If the requested name is
+    -- itself `bootstrap`, calling `fs.makeDir` twice is harmless and verified
+    -- as a directory both times.
     local directories = {
         "/dickos/system",
         "/dickos/lib",
@@ -493,6 +546,7 @@ local function createDirectoryLayout(ownerUsername)
         "/dickos/services",
         "/dickos/etc",
         "/dickos/home/" .. ownerUsername,
+        "/dickos/home/bootstrap",
         "/dickos/var/log",
         "/dickos/var/lib",
         "/dickos/var/integrity",
@@ -801,7 +855,8 @@ local function printSuccess(hostname, ownerUsername, machineID)
     print("Hostname:   " .. hostname)
     print("Owner:      " .. ownerUsername)
     print()
-    print("Stage-0, init, Recovery, logging, dickfetch, and dicklog are installed.")
+    print("Stage-0, init, Recovery, logging, and the DICK shell are installed.")
+    print("Interactive session: bootstrap (authentication is not implemented).")
     print("Reboot or power on the computer to enter DICK/OS.")
     print()
     print("Authentication subsystem is not installed yet.")
@@ -846,13 +901,13 @@ local function runInstaller()
     local installationPayload, payloadError = loadInstallationPayload()
 
     if installationPayload == nil then
-        fail("Unable to load the Milestone 2 installation payload.")
+        fail("Unable to load the shell-foundation installation payload.")
         print("       Details: " .. tostring(payloadError))
         print("No files were changed.")
         return
     end
 
-    ok("Stage-0, init, Recovery, logging, and utility payload available")
+    ok("Stage-0, shell, logging, and command payload available")
 
     local capturedSettings, settingsCaptureError = captureBootSettings()
 

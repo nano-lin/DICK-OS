@@ -21,9 +21,17 @@ local HAPPY_DICK = {
 
 -- A top-level Lua program receives arguments through `...`. Init supplies one
 -- explicit context table so this utility does not need to read a temporary
--- Boot ID from disk. A future DICK shell can invoke the same program with its
--- current runtime context instead of duplicating this presentation.
-local context = ...
+-- Boot ID from disk. The DICK shell invokes the same program with its current
+-- command context instead of duplicating this presentation.
+local context, firstArgument = ...
+
+-- Init and the DICK shell both supply a context table. A direct CraftOS
+-- rescue invocation may still request usage without fabricating runtime
+-- identity, while ordinary rendering continues to require the real context.
+if context == "--help" or firstArgument == "--help" then
+    print("Usage: dickfetch")
+    return
+end
 
 -- Require a non-empty string field from the explicit interface. Raising a
 -- clear Lua error is appropriate for direct callers; init protects dickfetch

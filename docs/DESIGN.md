@@ -275,13 +275,12 @@ Future intended usage may resemble:
 wget <URL> install.lua
 install
 
-The current development installer uses the repository as a local payload: it
-reads `src/startup.lua`, `src/dickos/system/init.lua`,
-`src/dickos/system/recovery.lua`, `src/dickos/lib/log.lua`,
-`src/dickos/bin/dickfetch.lua`, and `src/dickos/bin/dicklog.lua` beside
-`install.lua`, then writes them to their installed paths after confirmation.
-The installer writes Stage-0 last. A single-file download/bootstrap transport
-is not implemented yet and must not be confused with DickPkg or DickRepo.
+The current development installer uses the repository as a fixed local
+payload. It reads Stage-0, init, Recovery, the shell, the logger, dickfetch,
+dicklog, and the current command files below `src/`, then writes them to their
+installed paths after confirmation. The installer writes Stage-0 last. A
+single-file download/bootstrap transport is not implemented yet and must not
+be confused with DickPkg or DickRepo.
 
 Installer flow:
 
@@ -555,8 +554,19 @@ Target installed layout:
     │   └── hardware.lua
     │
     ├── bin/
+    │   ├── cat.lua
+    │   ├── df.lua
     │   ├── dickfetch.lua
-    │   └── dicklog.lua
+    │   ├── dicklog.lua
+    │   ├── echo.lua
+    │   ├── edit.lua
+    │   ├── hostname.lua
+    │   ├── ls.lua
+    │   ├── reboot.lua
+    │   ├── shutdown.lua
+    │   ├── status.lua
+    │   ├── uname.lua
+    │   └── uptime.lua
     ├── services/
     │
     ├── etc/
@@ -674,10 +684,19 @@ CraftOS
 The exact termination policy may differ depending on which component was
 terminated, but DICK/OS must remain in control of the machine.
 
-For the minimal 0.1 bootstrap, init receives the CC:T `terminate` event and
-returns an explicit restart result to Stage-0. Stage-0 then starts a fresh init
-attempt through its existing supervisor loop. A real Lua error and an
-unexpected normal return are different failure states and enter Recovery.
+Before the interactive shell starts, init receives the CC:T `terminate` event
+during the boot animation and returns an explicit restart result to Stage-0.
+Stage-0 starts a fresh init attempt with the same runtime context and Boot ID.
+A real init error and an unexpected normal return remain different failure
+states and enter Recovery.
+
+After the DICK shell starts, it owns Ctrl+T containment. Ctrl+T while `read` is
+waiting at an idle prompt only redraws the prompt. A normal child which uses
+ordinary CC:T event functions raises `Terminated`; the shell catches that child
+error, reports `Command terminated.`, logs a warning best-effort, and restores
+the same prompt and Boot ID. A deliberately raw-event child may choose to
+ignore `terminate`; forcibly scheduling or killing such a child is outside the
+current shell foundation.
 
 ---
 
@@ -720,6 +739,19 @@ Init is responsible for coordinating:
 
 Subsystem implementation should live in dedicated modules rather than making
 init.lua a giant file.
+
+The current implemented handoff is:
+
+```text
+init -> boot presentation -> dickfetch -> /dickos/system/shell.lua
+```
+
+Init combines Stage-0's runtime API version and Boot ID with the installed
+version, hostname, and Machine ID. It adds the temporary bootstrap-session user
+and home, then passes one in-memory table to the shell. Boot ID is never written
+to disk. A missing, invalid, crashing, or unexpectedly returning core shell is
+an init failure and therefore reaches existing Stage-0 Recovery. This core
+contract is separate from the shell's protected child-command boundary.
 
 ---
 
@@ -770,16 +802,15 @@ underline, or bootstrap-placeholder text.
 
 Init passes dickfetch one explicit table containing `version`, `hostname`,
 `machineID`, and `bootID`. The utility does not persist Boot ID or reconstruct
-it from the filesystem. A future DICK shell should invoke the same utility with
-the current runtime context; the shell itself is not implemented. Missing
-required metadata remains an init failure, while a missing, invalid, or
-crashing dickfetch is a noncritical presentation failure: init displays a
-minimal identity/status fallback and remains in its event wait-loop rather
-than entering Recovery.
+it from the filesystem. Missing required metadata remains an init failure,
+while a missing, invalid, or crashing dickfetch is a noncritical presentation
+failure: init displays a minimal identity/status fallback rather than entering
+Recovery.
 
-This post-boot presentation is the future session handoff point. Until a real
-DICK shell or session subsystem exists, minimal init remains in that wait-loop.
-It must not provide fake commands merely to fill the space.
+After either successful dickfetch or that fallback, init starts the DICK shell.
+The successful presentation remains on screen, one blank line separates it
+from the first prompt, and dickfetch is not redrawn for later commands. The
+user may run `dickfetch` again explicitly like any other `/dickos/bin` utility.
 
 ---
 
@@ -827,7 +858,7 @@ Shared configuration parsing/writing belongs in:
 
 # 20. Users
 
-Initial conceptual users:
+Future conceptual users:
 
 root
     UID = 0
@@ -837,7 +868,14 @@ first human user
     UID = 1000
     admin = true
 
-Installer creates the initial owner account.
+The current installer asks for an owner name and creates its home directory,
+but does not yet persist reusable account metadata. The shell foundation
+therefore uses `bootstrap` and `/dickos/home/bootstrap`; the installer creates
+that directory as part of its owned tree. This is an unauthenticated
+development-session label, not a login or proof of identity. The installer
+password is not persisted or recovered.
+
+A later authentication milestone may create the initial owner account.
 
 Future versions may support additional users.
 
@@ -893,54 +931,90 @@ DICK/OS and obtains unrestricted lower-level execution.
 
 # 23. DICK shell
 
-After login:
+The current bootstrap shell begins immediately after dickfetch, without a
+login screen:
 
-nano@core-01:~$
+```text
+bootstrap@core-01:~$
+```
 
-DICK/OS provides its own user-facing shell environment.
+It owns its prompt, cwd, home expansion, command parsing, command discovery,
+and execution protection. This session is not authenticated. The background is
+black; prompt fragments use restrained semantic colours, and the shell restores
+background, foreground, and cursor blink before every new prompt so child
+presentation state cannot permanently damage it.
 
-The shell owns:
+The initial cwd and home are `/dickos/home/bootstrap`. An exact home path is
+displayed as `~`, descendants as `~/...`, and `~`/`~/...` are expanded for
+built-ins and native commands. Relative paths use the shell-owned cwd. Path
+normalisation removes empty and `.` segments, applies `..`, and clamps at `/`;
+it does not invent Unix mounts or permission semantics.
 
-- PATH
-- aliases
-- prompt
-- environment
-- command discovery
-- DICK/OS command behavior
+The implemented resolver is shared by execution and `which`, in this order:
 
-CraftOS functionality may be reused internally when useful.
+1. registered shell built-ins;
+2. `/dickos/bin/<command>`;
+3. `/dickos/bin/<command>.lua`;
+4. an explicit relative or absolute path when the typed name contains `/`.
 
-However DICK/OS must not depend on CraftOS startup having accidentally created
-specific aliases or environment state.
+CraftOS PATH and aliases are never searched implicitly. Selected CraftOS ROM
+functionality may be wrapped explicitly; current `edit` loads the real ROM
+editor at `/rom/programs/edit.lua` and gives it an absolute path resolved from
+the DICK cwd. Leaving that editor returns to the protected DICK command call,
+not a CraftOS command prompt.
+
+The parser recognises whitespace plus matching single and double quotes.
+Unterminated input reports `Parse error: unterminated quote` and returns to the
+prompt. Pipes, redirection, substitution, escaping, globbing, scripts,
+background jobs, aliases, and job control are not implemented. `read` provides
+in-memory history for the current session only.
+
+Every external program is compiled and executed behind protected calls. A load
+or runtime failure prints the exact child diagnostic when available, writes a
+best-effort `system.log` record containing only the command name, restores the
+terminal, and returns to the prompt. Such a child failure is not an init or
+Recovery failure. The shell core itself is a required component: load failure,
+fatal runtime failure, or unexpected return is propagated through init to
+Stage-0 Recovery.
+
+Native programs under `/dickos/bin` receive a fresh first-argument context with
+runtime API version, Boot ID, version, hostname, Machine ID, bootstrap user,
+home, and a cwd snapshot. Explicit user programs outside that directory receive
+only their typed arguments. Boot ID therefore remains runtime-only. `dicklog`
+also retains direct CraftOS-rescue invocation with ordinary arguments.
+
+`exit` never falls through to CraftOS. It explains that exit is unavailable in
+bootstrap mode and directs the user to `reboot` or `shutdown`; explicit CraftOS
+access remains a Recovery selection only.
 
 ---
 
 # 24. Base commands
 
+The current shell-foundation built-ins are:
+
+- `help`, `clear`, `cd`, `pwd`, `which`, `exit`.
+
+The current external `/dickos/bin` commands are:
+
+- `ls`, `cat`, `echo`, `edit`;
+- `hostname`, `uname`, `uptime`, `df`, `status`;
+- `reboot`, `shutdown`;
+- `dickfetch`, `dicklog`.
+
+The following planned 0.1.0 commands are not implemented by this milestone.
+
 Filesystem/userland:
 
-- ls
-- cd
-- cat
 - touch
 - mkdir
 - cp
 - mv
 - rm
-- pwd
-- edit
-- which
-- clear
 
 System:
 
-- uname
-- uptime
-- df
-- hostname
-- status
 - peripherals
-- help
 
 Users:
 
@@ -1012,6 +1086,12 @@ help cat
 help sudo
 help service
 help dickctl
+
+The current bootstrap implementation registers short help for shell built-ins,
+discovers runnable names from `/dickos/bin`, and asks an external command for
+its own `--help` output when `help <command>` is used. New binaries therefore
+become discoverable without editing a central command list. Full manual pages
+and package-installed help metadata remain future work.
 
 Preferred style:
 
@@ -1503,9 +1583,13 @@ Current levels are:
 progress, Recovery decisions, and fallback transitions. Its Boot ID groups
 Ctrl+T init restarts and Recovery retries under the same Stage-0 execution. A
 new Stage-0 execution appends a new marker and normally has a new Boot ID.
-`system.log` begins the longer-lived system/session diagnostic stream; the
-minimal init currently records bootstrap-session readiness and terminate-driven
-restart there.
+`system.log` begins the longer-lived system/session diagnostic stream. Init
+records bootstrap-session readiness, and the shell records startup, missing
+commands, ordinary command termination, and child load/runtime failures. Shell
+records include the resolved command name but deliberately omit the complete
+raw argument line so future secrets are not blindly copied into logs. Reboot
+and shutdown requests are also logged best-effort before invoking the real
+power API.
 
 Both files are bounded before appending a record which would cross their limit:
 
@@ -1521,7 +1605,8 @@ must never cause init to enter Recovery or prevent Recovery/Fallback actions.
 shows the last 20 active `boot.log` lines. It also accepts `boot`, `system`, and
 a positive line count, for example `dicklog boot 50`. It intentionally has no
 search, filter, or archive framework yet and can be run directly by path from a
-CraftOS rescue shell.
+CraftOS rescue shell. DICK shell invocation shifts its native context first;
+manual CraftOS forms and defaults remain unchanged.
 
 Future `/dickos/var/log/auth.log` and `/dickos/var/log/dicknet.log` remain
 planned. They are not created until their corresponding subsystems exist.

@@ -5,6 +5,7 @@ local VERSION_PATH = "/dickos/etc/version"
 local HOSTNAME_PATH = "/dickos/etc/hostname"
 local MACHINE_ID_PATH = "/dickos/etc/machine-id"
 local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
+local SHELL_PATH = "/dickos/system/shell.lua"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 local STAGE0_RESTART_RESULT = "restart"
 local EXPECTED_RUNTIME_API_VERSION = 1
@@ -383,8 +384,9 @@ end
 -- `os.startTimer` queues a future timer event. `os.pullEventRaw` waits without
 -- converting Ctrl+T into an immediate Lua error, allowing this helper to return
 -- false when it sees `terminate`. Init can then return Stage-0's established
--- `restart` result even when Ctrl+T occurs during the animation rather than the
--- later bootstrap wait-loop. Other events are intentionally ignored here.
+-- `restart` result while Ctrl+T still belongs to pre-shell bootstrap. Once the
+-- interactive shell starts, its own prompt and child-command policy takes
+-- over. Other events are intentionally ignored here.
 local function waitForBootFrame()
     local timerID = os.startTimer(BOOT_FRAME_DELAY)
 
@@ -482,6 +484,31 @@ local function drawDickfetchFallback(context, presentationError)
     )
 end
 
+-- Start the core shell behind init's own boundary. A missing or malformed
+-- shell is not a cosmetic failure: returning a reason lets the caller log it
+-- and raise an init error into the established Stage-0 Recovery path. A
+-- healthy interactive shell is expected not to return from this call at all.
+local function runShell(context)
+    local loadSucceeded, shellProgram, loadError = pcall(
+        loadfile,
+        SHELL_PATH
+    )
+
+    if not loadSucceeded or type(shellProgram) ~= "function" then
+        local failure = loadSucceeded and loadError or shellProgram
+
+        return "Unable to load DICK shell: " .. tostring(failure)
+    end
+
+    local shellSucceeded, shellError = pcall(shellProgram, context)
+
+    if not shellSucceeded then
+        return "DICK shell failed: " .. tostring(shellError)
+    end
+
+    return "DICK shell returned unexpectedly."
+end
+
 prepareTerminal()
 logBestEffort(bootLogger, "info", "init", "init started")
 
@@ -531,24 +558,23 @@ end
 logBestEffort(bootLogger, "info", "init", "Bootstrap session ready")
 logBestEffort(systemLogger, "info", "init", "Bootstrap session ready")
 
--- This point is the deliberate future session handoff. A later milestone may
--- replace the bootstrap wait-loop below with a real DICK shell/session entry
--- function. Until that subsystem exists, init remains active without offering
--- fake commands or returning control to CraftOS.
---
--- CC:T programs cooperate through an event queue. `os.pullEventRaw` pauses this
--- process until the next event arrives, so init does not burn CPU while idle.
--- Unlike `os.pullEvent`, the Raw variant returns the `terminate` event produced
--- by Ctrl+T instead of immediately raising the "Terminated" error.
-while true do
-    local eventName = os.pullEventRaw()
+-- Authentication does not exist yet and the installer does not persist its
+-- owner prompt as account metadata. This explicit `bootstrap` identity is a
+-- development-session label, not proof of authentication. Boot ID remains in
+-- memory and is handed directly to shell commands instead of being persisted.
+local shellContext = {
+    runtimeApiVersion = runtimeContext.apiVersion,
+    bootID = bootID,
+    version = version,
+    hostname = hostname,
+    machineID = machineID,
+    user = "bootstrap",
+    home = "/dickos/home/bootstrap",
+}
 
-    if eventName == "terminate" then
-        local restartMessage =
-            "Terminate event received; requesting init restart"
+logBestEffort(bootLogger, "info", "init", "DICK shell starting")
+local shellFailure = runShell(shellContext)
 
-        logBestEffort(bootLogger, "warn", "init", restartMessage)
-        logBestEffort(systemLogger, "warn", "init", restartMessage)
-        return STAGE0_RESTART_RESULT
-    end
-end
+logBestEffort(bootLogger, "error", "shell", shellFailure)
+logBestEffort(systemLogger, "error", "shell", shellFailure)
+error(shellFailure, 0)

@@ -9,10 +9,18 @@ local LOG_PATHS = {
 local DEFAULT_LOG_NAME = "boot"
 local DEFAULT_LINE_COUNT = 20
 
--- A top-level CraftOS program receives command-line arguments through `...`.
--- With no arguments these locals are nil, so the defaults below select the
--- latest 20 active boot-log lines.
-local requestedLogName, requestedLineCount = ...
+-- CraftOS rescue supplies ordinary arguments directly, while the DICK shell
+-- places native command context in the first slot. Shifting only a table first
+-- argument preserves all established manual forms such as
+-- `/dickos/bin/dicklog.lua boot 50` without storing or requiring Boot ID.
+local firstArgument, secondArgument, thirdArgument = ...
+local requestedLogName = firstArgument
+local requestedLineCount = secondArgument
+
+if type(firstArgument) == "table" then
+    requestedLogName = secondArgument
+    requestedLineCount = thirdArgument
+end
 
 local function prepareTerminal()
     term.setBackgroundColor(colors.black)
@@ -27,6 +35,11 @@ local function printUsage()
     print("  dicklog")
     print("  dicklog boot 50")
     print("  dicklog system")
+end
+
+if requestedLogName == "--help" then
+    printUsage()
+    return
 end
 
 -- Validate one positive whole-number line count. `tonumber` returns nil when
