@@ -77,6 +77,13 @@ DICK/OS 0.1.0 installation.
 
 Basic Computers do not run full DICK/OS.
 
+The colour terminal of an Advanced Computer is a baseline DICK/OS capability,
+not an optional enhancement. Full DICK/OS interfaces may use all standard
+CC:Tweaked colours and are not required to provide a separately designed
+monochrome mode. A cheap `term.isColor()` check may still be used defensively,
+but Basic Computer UI compatibility must not constrain the supported visual
+design.
+
 Basic Computers may eventually run separate lightweight appliance
 software such as DIKModem.
 
@@ -432,6 +439,58 @@ node-01
 
 CC ID, machine ID and hostname must never be treated as interchangeable.
 
+## Identity duplication limitation
+
+Physical CC:T computer blocks are not guaranteed to have distinct observable
+identities after block or NBT state has been copied. Two physical computers may
+report the same CC ID and therefore address the same persistent CC:T filesystem.
+In that situation they also see the same DICK/OS machine ID, hostname, and
+installed files.
+
+This exact duplicate is not always detectable locally. If both physical
+computers observe the same CC ID and filesystem, each computer sees internally
+consistent identity data. DICK/OS must not claim that the permanent machine ID
+alone proves that only one physical computer exists.
+
+## Future identity health model
+
+The first future check is local identity consistency. DICK/OS can compare the
+current `os.getComputerID()` value with the CC ID encoded in the installed
+machine ID:
+
+```text
+Current CC ID: 9
+Machine ID:    DCK-C-7-A91F
+
+IDENTITY_CONFLICT
+```
+
+This detects a filesystem copied or moved to a computer with a different CC
+ID. It cannot detect two physical computers which both expose the same CC ID
+and shared filesystem.
+
+The second future check is runtime/network duplicate detection. Each cold boot
+may generate a temporary best-effort Boot ID such as `B-5F921A`. A Boot ID:
+
+- is regenerated for every boot execution;
+- is not a permanent machine identity;
+- is not a password, token, or security secret;
+- does not replace `/dickos/etc/machine-id`.
+
+A future DickNet node announcement may contain:
+
+```text
+machine_id
+cc_id
+hostname
+boot_id
+```
+
+If two simultaneously visible announcements contain the same machine ID but
+different Boot IDs, DICK/OS should report a possible `IDENTITY_CONFLICT`. This
+network mechanism is design foundation only; no Boot ID or DickNet duplicate
+detection is implemented in the current bootstrap.
+
 ---
 
 # 12. Filesystem layout
@@ -611,23 +670,42 @@ init.lua a giant file.
 
 # 17. Boot presentation
 
-Example:
+Normal DICK/OS boot uses a black background and begins with branded identity:
 
+```text
 DICK/OS 0.1.0-unstable
+---------------------------------------------------
 Distributed Infrastructure & Computer Kit
+---------------------------------------------------
+```
 
-[ OK ] Initializing system
-[ OK ] Loading machine identity
-[ OK ] Checking system integrity
-[ OK ] Loading configuration
-[ OK ] Detecting peripherals
-[ OK ] Starting system services
-[ OK ] Starting DickNet
-[ OK ] Starting authentication
+The current minimal init then animates only real bootstrap stages:
 
-System ready.
+```text
+[ OK ] Stage-0 supervisor
+[ OK ] Version metadata
+[ .. ] Machine identity
+[    ] Hostname metadata
+[    ] Bootstrap session
 
-The boot sequence intentionally has a retro Unix/DOS appearance.
+Activity: Machine identity
+[#####################--------------------]  50%
+```
+
+A stage is represented by a small record containing a label and visual state.
+This leaves an obvious place to add future real init work without introducing a
+generic boot framework. Authentication, integrity, services, drivers, dickd,
+DickNet, and package management must not appear as successful stages until
+those subsystems exist.
+
+After progress completes, init clears the screen and displays the small happy
+DICK/OS mascot beside the installed version, hostname, machine ID, and green
+`SYSTEM READY` state. The boot sequence intentionally has a retro Unix/DOS
+appearance.
+
+The ready screen is the future session handoff point. Until a real DICK shell
+or session subsystem exists, minimal init remains in its event wait-loop. It
+must not provide a fake shell or fake commands merely to fill that space.
 
 ---
 
@@ -643,7 +721,13 @@ Example:
 
 This delay is cosmetic.
 
-Actual initialization must never wait merely to make the system appear slower.
+The minimal bootstrap may use approximately one second of short timer frames to
+make progress movement legible. The animation must preserve terminate handling
+and must not imply that nonexistent subsystem work is occurring.
+
+Real initialization must not be extended merely to make the system appear
+slower. When a stage later performs actual work, that work and any cosmetic
+frame delay remain conceptually separate.
 
 Future versions may allow the user to skip cosmetic delays while real boot work
 continues normally.
@@ -908,6 +992,30 @@ The visual direction takes inspiration from:
 - character-based TUIs
 
 A pixel-based graphical desktop is not required for 0.1.0.
+
+## Visual language
+
+Full DICK/OS targets the Advanced Computer colour terminal. The three boot
+states must be immediately distinguishable:
+
+- normal DICK/OS: black background;
+- DICK/OS Recovery: blue boxed TUI;
+- Emergency Fallback: red boxed TUI.
+
+Shared colour semantics are:
+
+- lime/green: healthy, successful, complete, `[ OK ]`;
+- light blue/cyan: information, activity, network information;
+- yellow: warning, degraded state, confirmation requiring attention;
+- red: failure, critical state, `IDENTITY_CONFLICT`;
+- white: primary text;
+- light gray/gray: secondary text and separators;
+- magenta: reserved for `MODIFIED` and future integrity state.
+
+The compact DICK/OS mascot has happy and sad variants. Happy appears after a
+successful normal boot. Sad appears inside Recovery and Emergency Fallback.
+The art must remain small enough to share the standard Advanced Computer screen
+with diagnostics and actions.
 
 ---
 
@@ -1348,20 +1456,32 @@ FAILED
 
 # 47. Recovery environment
 
-If normal boot cannot continue:
+The current bootstrap Recovery is a blue full-screen boxed TUI. It displays a
+sad mascot, wraps the boot diagnostic so the menu remains visible, and offers:
 
+```text
 DICK/OS RECOVERY
 
-1. Verify system
-2. Restore system
-3. Reinstall DICK/OS
-4. Enter CraftOS rescue shell
-5. Reboot
-6. Shutdown
+1. Retry normal boot
+2. Enter CraftOS rescue shell
+3. Reboot
+4. Shutdown
+```
 
 CraftOS rescue shell is explicitly selected.
 
 It is not an accidental fallback.
+
+If Recovery itself is missing or fails, Stage-0 displays a red boxed Emergency
+Fallback with the sad mascot, Recovery failure, original boot failure, and the
+same four survival actions. Its minimal drawing, wrapping, colour, mascot, and
+input logic remain self-contained inside `/startup.lua`. This small duplication
+is intentional: the last-resort path cannot depend on init, Recovery, or a
+shared DICK/OS UI library which may be unavailable.
+
+Future integrity verification, restore, and reinstall actions may extend the
+real Recovery environment only after those capabilities exist. The bootstrap
+must not display such actions as if they already work.
 
 ---
 
