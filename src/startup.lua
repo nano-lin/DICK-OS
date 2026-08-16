@@ -16,6 +16,67 @@ local FALLBACK_BORDER = colors.yellow
 local FALLBACK_PRIMARY_TEXT = colors.white
 local FALLBACK_SECONDARY_TEXT = colors.lightGray
 
+-- CC:T reserves byte values 128 through 159 for 2-by-3-cell drawing
+-- characters. They are single terminal characters, unlike UTF-8 box glyphs
+-- whose several bytes would be rendered separately as garbage. Each table
+-- below gives a semantic name to one drawing character and records whether
+-- its foreground and background colours must be exchanged to obtain the
+-- complementary shape stored in the font.
+--
+-- These shapes form a clean single-line frame in CC:T's native font. Their
+-- exact pixel alignment still needs visual verification in Minecraft because
+-- a desktop editor cannot reproduce CC:T's terminal renderer.
+local BOX_HORIZONTAL = { character = string.char(140), invertColors = false }
+local BOX_VERTICAL_LEFT = { character = string.char(149), invertColors = false }
+local BOX_VERTICAL_RIGHT = { character = string.char(149), invertColors = true }
+local BOX_TOP_LEFT = { character = string.char(156), invertColors = false }
+local BOX_TOP_RIGHT = { character = string.char(147), invertColors = true }
+local BOX_BOTTOM_LEFT = { character = string.char(141), invertColors = false }
+local BOX_BOTTOM_RIGHT = { character = string.char(142), invertColors = false }
+
+-- Generate one temporary identity for this execution of Stage-0.
+--
+-- A seed is the starting value from which Lua's pseudo-random number generator
+-- produces a repeatable sequence. `math.randomseed` explicitly resets that
+-- global generator, so Boot ID generation does not depend on an unknown
+-- sequence left behind by CraftOS or another startup program. UTC epoch time
+-- changes between ordinary starts, while the CC computer ID helps separate
+-- computers which start at nearly the same moment.
+--
+-- This is not cryptographic protection: the inputs are observable, the
+-- generator is predictable, and collisions remain possible. A Boot ID is only
+-- a best-effort label for one live installation execution, not a password,
+-- authentication token, or permanent identity. That level of uniqueness is
+-- sufficient for the current runtime identifier and can be replaced later
+-- without changing the Stage-0 supervisor contract.
+local function generateBootID()
+    local hexadecimalDigits = "0123456789ABCDEF"
+    local identifierCharacters = {}
+    local ccID = os.getComputerID()
+    local seed = os.epoch("utc") + ccID * 65537
+
+    math.randomseed(seed)
+
+    for position = 1, 8 do
+        local digitIndex = math.random(1, #hexadecimalDigits)
+        identifierCharacters[position] = string.sub(
+            hexadecimalDigits,
+            digitIndex,
+            digitIndex
+        )
+    end
+
+    return "B-" .. table.concat(identifierCharacters)
+end
+
+-- This table is created once when CraftOS executes startup.lua. The same table
+-- is passed to every init attempt made by this supervisor execution, so retry
+-- and Ctrl+T restart preserve the Boot ID. It is deliberately never written
+-- to the filesystem or settings; a fresh Stage-0 execution creates a new one.
+local runtimeContext = {
+    bootID = generateBootID(),
+}
+
 -- Emergency Fallback cannot load branding from init, Recovery, or a future UI
 -- library because those components may be the reason boot failed. Its compact
 -- sad mascot therefore remains inside Stage-0 as a table of strings. `ipairs`
@@ -87,7 +148,7 @@ local function attemptNormalBoot()
         return "recovery", "Required init is missing: " .. INIT_PATH
     end
 
-    local initSucceeded, initResult = runProtected(INIT_PATH)
+    local initSucceeded, initResult = runProtected(INIT_PATH, runtimeContext)
 
     if not initSucceeded then
         return "recovery", "init crashed: " .. describeError(initResult)
@@ -124,13 +185,39 @@ local function writeFallbackAt(x, y, text, color)
     term.write(clippedText)
 end
 
--- Draw the red fallback background and a reliable ASCII border. The interior
--- is filled when `term.clear` runs with the red background already selected;
--- only the edge characters need to be written afterwards.
+-- Draw one native CC:T drawing character, optionally repeated.
+--
+-- Some of CC:T's drawing shapes are stored as the colour-inverse of the shape
+-- we need. For those entries, exchanging text and background colours reveals
+-- the complementary pixels. The background is restored afterwards so normal
+-- fallback text still appears on red.
+local function writeFallbackBoxGlyphAt(x, y, glyph, count)
+    local terminalWidth, terminalHeight = term.getSize()
+
+    if x < 1 or x > terminalWidth or y < 1 or y > terminalHeight then
+        return
+    end
+
+    local repeatCount = math.min(count or 1, terminalWidth - x + 1)
+    local textColor = FALLBACK_BORDER
+    local backgroundColor = FALLBACK_BACKGROUND
+
+    if glyph.invertColors then
+        textColor, backgroundColor = backgroundColor, textColor
+    end
+
+    term.setTextColor(textColor)
+    term.setBackgroundColor(backgroundColor)
+    term.setCursorPos(x, y)
+    term.write(string.rep(glyph.character, repeatCount))
+    term.setBackgroundColor(FALLBACK_BACKGROUND)
+end
+
+-- Draw the red fallback background and its native semigraphics border. The
+-- interior is filled when `term.clear` runs with red already selected; only
+-- the edge characters need to be written afterwards.
 local function drawFallbackBox()
     local terminalWidth, terminalHeight = term.getSize()
-    local horizontalEdge = "+" ..
-        string.rep("-", terminalWidth - 2) .. "+"
 
     term.setBackgroundColor(FALLBACK_BACKGROUND)
     term.setTextColor(FALLBACK_PRIMARY_TEXT)
@@ -138,13 +225,30 @@ local function drawFallbackBox()
     term.clear()
     term.setCursorPos(1, 1)
 
-    writeFallbackAt(1, 1, horizontalEdge, FALLBACK_BORDER)
-    writeFallbackAt(1, terminalHeight, horizontalEdge, FALLBACK_BORDER)
+    writeFallbackBoxGlyphAt(1, 1, BOX_TOP_LEFT)
+    writeFallbackBoxGlyphAt(2, 1, BOX_HORIZONTAL, terminalWidth - 2)
+    writeFallbackBoxGlyphAt(terminalWidth, 1, BOX_TOP_RIGHT)
+    writeFallbackBoxGlyphAt(1, terminalHeight, BOX_BOTTOM_LEFT)
+    writeFallbackBoxGlyphAt(
+        2,
+        terminalHeight,
+        BOX_HORIZONTAL,
+        terminalWidth - 2
+    )
+    writeFallbackBoxGlyphAt(
+        terminalWidth,
+        terminalHeight,
+        BOX_BOTTOM_RIGHT
+    )
 
     for row = 2, terminalHeight - 1 do
-        writeFallbackAt(1, row, "|", FALLBACK_BORDER)
-        writeFallbackAt(terminalWidth, row, "|", FALLBACK_BORDER)
+        writeFallbackBoxGlyphAt(1, row, BOX_VERTICAL_LEFT)
+        writeFallbackBoxGlyphAt(terminalWidth, row, BOX_VERTICAL_RIGHT)
     end
+end
+
+local function drawFallbackSeparator(x, row, width)
+    writeFallbackBoxGlyphAt(x, row, BOX_HORIZONTAL, width)
 end
 
 local function drawFallbackMascot(x, y)
@@ -229,27 +333,28 @@ local function drawEmergencyFallbackScreen(
 )
     local terminalWidth, terminalHeight = term.getSize()
     local diagnosticWidth = math.max(10, terminalWidth - 13)
-    local menuStart = terminalHeight - 8
+    local menuStart = terminalHeight - 7
     local mascotX = math.max(3, terminalWidth - 9)
 
     drawFallbackBox()
     writeFallbackAt(3, 2, "DICK/OS EMERGENCY FALLBACK", FALLBACK_PRIMARY_TEXT)
-    writeFallbackAt(3, 3, "CRITICAL BOOT FAILURE", FALLBACK_BORDER)
+    writeFallbackAt(3, 4, "CRITICAL BOOT FAILURE", FALLBACK_BORDER)
     drawFallbackMascot(mascotX, 2)
+    drawFallbackSeparator(3, 5, diagnosticWidth)
 
-    writeFallbackAt(3, 5, "Recovery failure:", FALLBACK_BORDER)
+    writeFallbackAt(3, 6, "Recovery failure:", FALLBACK_BORDER)
     drawFallbackWrappedText(
         3,
-        6,
+        7,
         recoveryFailureReason,
         diagnosticWidth,
         2
     )
 
-    writeFallbackAt(3, 8, "Original boot failure:", FALLBACK_BORDER)
+    writeFallbackAt(3, 9, "Original boot failure:", FALLBACK_BORDER)
     drawFallbackWrappedText(
         3,
-        9,
+        10,
         originalBootFailureReason or
             "Unavailable because Stage-0 itself failed.",
         diagnosticWidth,
@@ -264,7 +369,7 @@ local function drawEmergencyFallbackScreen(
     if notice ~= nil then
         writeFallbackAt(
             3,
-            terminalHeight - 4,
+            terminalHeight - 3,
             notice,
             FALLBACK_SECONDARY_TEXT
         )

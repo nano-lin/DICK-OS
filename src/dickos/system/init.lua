@@ -4,6 +4,7 @@
 local VERSION_PATH = "/dickos/etc/version"
 local HOSTNAME_PATH = "/dickos/etc/hostname"
 local MACHINE_ID_PATH = "/dickos/etc/machine-id"
+local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
 local STAGE0_RESTART_RESULT = "restart"
 
 -- Full DICK/OS supports the Advanced Computer, so its colour terminal is a
@@ -16,23 +17,30 @@ local SECONDARY_TEXT = colors.lightGray
 local SEPARATOR_COLOR = colors.gray
 local INFORMATION_COLOR = colors.lightBlue
 local SUCCESS_COLOR = colors.lime
+local WARNING_COLOR = colors.yellow
+
+-- CC:T's bytes 128 through 159 are native 2-by-3-cell drawing characters.
+-- `string.char` creates one such byte, while pasted UTF-8 box characters would
+-- become several unrelated terminal glyphs. Some entries use colour inversion
+-- because CC:T stores one shape from each foreground/background complement.
+local BOX_HORIZONTAL = { character = string.char(140), invertColors = false }
+local BOX_VERTICAL_LEFT = { character = string.char(149), invertColors = false }
+local BOX_VERTICAL_RIGHT = { character = string.char(149), invertColors = true }
+local BOX_TOP_LEFT = { character = string.char(156), invertColors = false }
+local BOX_TOP_RIGHT = { character = string.char(147), invertColors = true }
+local BOX_BOTTOM_LEFT = { character = string.char(141), invertColors = false }
+local BOX_BOTTOM_RIGHT = { character = string.char(142), invertColors = false }
+local BOX_LEFT_T = { character = string.char(157), invertColors = false }
+local BOX_RIGHT_T = { character = string.char(145), invertColors = true }
 
 local BOOT_FRAMES_PER_STAGE = 4
 local BOOT_FRAME_DELAY = 0.05
 
--- ASCII art is stored as a numerically indexed table of strings. `ipairs`
--- visits those strings from first to last, which lets drawMascot render one
--- terminal row at a time without embedding cursor movement inside the art.
--- The mascot is intentionally only eight columns wide so it fits beside system
--- information on the standard Advanced Computer terminal.
-local HAPPY_DICK = {
-    "   ____",
-    "  /+ + \\",
-    "  \\ U  /",
-    "   |  |",
-    "   |  |",
-    "  (_)(_)",
-}
+-- A top-level Lua chunk receives arguments through `...`. Stage-0 passes the
+-- same small table on every init attempt made during one supervisor execution.
+-- Init reads its Boot ID but does not turn that table into a general state
+-- manager and never persists it.
+local runtimeContext = ...
 
 -- Each stage is a small Lua table containing the text shown to the user and
 -- its current visual state. This is enough structure for later init work to
@@ -74,19 +82,70 @@ local function writeAt(x, y, text, color)
     term.write(clippedText)
 end
 
-local function drawHorizontalRule(row)
-    local terminalWidth = term.getSize()
+-- Write one native CC:T drawing character, optionally repeated.
+--
+-- The drawing-character table records when foreground and background colours
+-- must be exchanged to reveal a complementary shape. Restoring the black
+-- background afterwards prevents an inverted corner from affecting later
+-- ordinary text.
+local function writeBoxGlyphAt(x, y, glyph, count)
+    local terminalWidth, terminalHeight = term.getSize()
 
-    writeAt(1, row, string.rep("-", terminalWidth), SEPARATOR_COLOR)
+    if x < 1 or x > terminalWidth or y < 1 or y > terminalHeight then
+        return
+    end
+
+    local repeatCount = math.min(count or 1, terminalWidth - x + 1)
+    local textColor = SEPARATOR_COLOR
+    local backgroundColor = BOOT_BACKGROUND
+
+    if glyph.invertColors then
+        textColor, backgroundColor = backgroundColor, textColor
+    end
+
+    term.setTextColor(textColor)
+    term.setBackgroundColor(backgroundColor)
+    term.setCursorPos(x, y)
+    term.write(string.rep(glyph.character, repeatCount))
+    term.setBackgroundColor(BOOT_BACKGROUND)
 end
 
--- Draw a mascot by placing each table entry on the next terminal row.
--- Keeping this helper unaware of the art itself allows the same ready-screen
--- layout to use a different mascot state later without changing coordinates.
-local function drawMascot(art, x, y, color)
-    for rowOffset, line in ipairs(art) do
-        writeAt(x, y + rowOffset - 1, line, color)
+-- Centre a string between the two vertical frame edges. Lua's `#` operator
+-- returns the byte length of these ASCII headings, which is also their CC:T
+-- terminal width. `math.floor` places any unavoidable odd spare cell on the
+-- right side.
+local function writeCenteredInside(row, text, color)
+    local terminalWidth = term.getSize()
+    local innerWidth = terminalWidth - 2
+    local clippedText = string.sub(tostring(text), 1, innerWidth)
+    local x = 2 + math.floor((innerWidth - #clippedText) / 2)
+
+    writeAt(x, row, clippedText, color)
+end
+
+local function drawBootBox()
+    local terminalWidth, terminalHeight = term.getSize()
+
+    prepareTerminal()
+    writeBoxGlyphAt(1, 1, BOX_TOP_LEFT)
+    writeBoxGlyphAt(2, 1, BOX_HORIZONTAL, terminalWidth - 2)
+    writeBoxGlyphAt(terminalWidth, 1, BOX_TOP_RIGHT)
+    writeBoxGlyphAt(1, terminalHeight, BOX_BOTTOM_LEFT)
+    writeBoxGlyphAt(2, terminalHeight, BOX_HORIZONTAL, terminalWidth - 2)
+    writeBoxGlyphAt(terminalWidth, terminalHeight, BOX_BOTTOM_RIGHT)
+
+    for row = 2, terminalHeight - 1 do
+        writeBoxGlyphAt(1, row, BOX_VERTICAL_LEFT)
+        writeBoxGlyphAt(terminalWidth, row, BOX_VERTICAL_RIGHT)
     end
+end
+
+local function drawBootSeparator(row)
+    local terminalWidth = term.getSize()
+
+    writeBoxGlyphAt(1, row, BOX_LEFT_T)
+    writeBoxGlyphAt(2, row, BOX_HORIZONTAL, terminalWidth - 2)
+    writeBoxGlyphAt(terminalWidth, row, BOX_RIGHT_T)
 end
 
 -- Read one required metadata line from the installed filesystem.
@@ -135,20 +194,40 @@ local function requireValue(path, description)
     return value
 end
 
-local function drawBootHeader(version)
-    prepareTerminal()
+-- Validate the per-boot value supplied by Stage-0.
+--
+-- The exact pattern makes accidental interface breakage a real init failure:
+-- `B-` must be followed by eight uppercase hexadecimal characters. This value
+-- cannot be recovered from disk by design, so a missing or malformed runtime
+-- context means the required live identity is unavailable.
+local function requireBootID(context)
+    if type(context) ~= "table" then
+        error("Stage-0 did not supply the runtime context.", 0)
+    end
 
-    writeAt(2, 1, "DICK/OS", PRIMARY_TEXT)
-    writeAt(10, 1, version, SECONDARY_TEXT)
-    drawHorizontalRule(2)
-    writeAt(
-        2,
-        3,
+    local bootID = context.bootID
+
+    if type(bootID) ~= "string" or not string.match(
+        bootID,
+        "^B%-[0-9A-F][0-9A-F][0-9A-F][0-9A-F]" ..
+            "[0-9A-F][0-9A-F][0-9A-F][0-9A-F]$"
+    ) then
+        error("Stage-0 supplied an invalid Boot ID.", 0)
+    end
+
+    return bootID
+end
+
+local function drawBootHeader(version)
+    drawBootBox()
+    writeCenteredInside(3, "DICK/OS " .. version, PRIMARY_TEXT)
+    writeCenteredInside(
+        4,
         "Distributed Infrastructure & Computer Kit",
         INFORMATION_COLOR
     )
-    drawHorizontalRule(4)
-    writeAt(2, 6, "BOOTSTRAP SEQUENCE", PRIMARY_TEXT)
+    drawBootSeparator(6)
+    writeAt(3, 8, "BOOTSTRAP SEQUENCE", PRIMARY_TEXT)
 end
 
 local function drawBootStage(stage, row)
@@ -172,7 +251,7 @@ end
 
 local function drawAllBootStages()
     for stageIndex, stage in ipairs(BOOT_STAGES) do
-        drawBootStage(stage, 6 + stageIndex)
+        drawBootStage(stage, 8 + stageIndex)
     end
 end
 
@@ -271,23 +350,45 @@ local function drawInformationField(x, y, label, value)
     writeAt(x + 12, y, value, PRIMARY_TEXT)
 end
 
-local function drawReadyScreen(version, hostname, machineID)
+-- Load the post-boot presentation as a separate utility.
+--
+-- `loadfile` returns nil plus a compile diagnostic when dickfetch is missing or
+-- syntactically invalid. `pcall` then converts a runtime rendering error into a
+-- false result. Unlike metadata failures, either presentation failure is
+-- noncritical: the caller can draw a minimal status view and keep init alive.
+local function runDickfetch(context)
+    local dickfetchProgram, loadError = loadfile(DICKFETCH_PATH)
+
+    if dickfetchProgram == nil then
+        return false, "Unable to load dickfetch: " .. tostring(loadError)
+    end
+
+    local runSucceeded, runError = pcall(dickfetchProgram, context)
+
+    if not runSucceeded then
+        return false, "dickfetch failed: " .. tostring(runError)
+    end
+
+    return true, nil
+end
+
+-- Show required identity values even when the richer dickfetch presentation
+-- cannot run. This keeps a cosmetic utility failure visibly degraded but does
+-- not misreport healthy metadata as a catastrophic boot failure.
+local function drawDickfetchFallback(context, presentationError)
     prepareTerminal()
 
-    writeAt(14, 2, "DICK/OS", INFORMATION_COLOR)
-    writeAt(14, 3, version, SECONDARY_TEXT)
-
-    drawMascot(HAPPY_DICK, 3, 4, SUCCESS_COLOR)
-    drawInformationField(14, 5, "Hostname:", hostname)
-    drawInformationField(14, 6, "Machine ID:", machineID)
-    writeAt(14, 9, "SYSTEM READY", SUCCESS_COLOR)
-
-    drawHorizontalRule(12)
-    writeAt(2, 14, "Bootstrap environment active.", INFORMATION_COLOR)
+    writeAt(3, 2, "DICK/OS", INFORMATION_COLOR)
+    writeAt(3, 3, context.version, SECONDARY_TEXT)
+    drawInformationField(3, 5, "Hostname:", context.hostname)
+    drawInformationField(3, 6, "Machine ID:", context.machineID)
+    drawInformationField(3, 7, "Boot ID:", context.bootID)
+    writeAt(3, 9, "SYSTEM READY", SUCCESS_COLOR)
+    writeAt(3, 11, "[WARN] dickfetch presentation unavailable", WARNING_COLOR)
     writeAt(
-        2,
-        16,
-        "Future DICK shell handoff is not installed yet.",
+        3,
+        12,
+        presentationError,
         SECONDARY_TEXT
     )
 end
@@ -297,6 +398,7 @@ prepareTerminal()
 local version = requireValue(VERSION_PATH, "DICK/OS version")
 local hostname = requireValue(HOSTNAME_PATH, "hostname")
 local machineID = requireValue(MACHINE_ID_PATH, "machine ID")
+local bootID = requireBootID(runtimeContext)
 
 drawBootHeader(version)
 
@@ -304,7 +406,20 @@ if not animateBootProgress() then
     return STAGE0_RESTART_RESULT
 end
 
-drawReadyScreen(version, hostname, machineID)
+-- Init adds persistent installation metadata to Stage-0's runtime-only Boot ID
+-- and passes one explicit presentation interface to dickfetch. The table is
+-- not saved and is intentionally smaller than a general session-state object.
+local dickfetchContext = {
+    version = version,
+    hostname = hostname,
+    machineID = machineID,
+    bootID = bootID,
+}
+local presentationSucceeded, presentationError = runDickfetch(dickfetchContext)
+
+if not presentationSucceeded then
+    drawDickfetchFallback(dickfetchContext, presentationError)
+end
 
 -- This point is the deliberate future session handoff. A later milestone may
 -- replace the bootstrap wait-loop below with a real DICK shell/session entry

@@ -389,12 +389,13 @@ local function readSourceFile(path)
     return contentsOrError, nil
 end
 
--- Load the three real Milestone 2 programs into a small payload table.
+-- Load the four real Milestone 2 programs into a small payload table.
 --
 -- Each entry maps a repository source path to its final installed path. The
--- ordering is intentional: init and recovery are deployed before startup.lua,
--- so the boot entry point is the last program file exposed on disk. No generic
--- package/dependency framework is needed for three fixed bootstrap files.
+-- ordering is intentional: init, Recovery, and dickfetch are deployed before
+-- startup.lua, so the boot entry point is the last program file exposed on
+-- disk. No generic package/dependency framework is needed for four fixed
+-- bootstrap files.
 local function loadInstallationPayload()
     local runningProgram = shell.getRunningProgram()
     local installerDirectory = fs.getDir(runningProgram)
@@ -407,6 +408,10 @@ local function loadInstallationPayload()
         {
             sourcePath = fs.combine(sourceRoot, "dickos/system/recovery.lua"),
             destinationPath = "/dickos/system/recovery.lua",
+        },
+        {
+            sourcePath = fs.combine(sourceRoot, "dickos/bin/dickfetch.lua"),
+            destinationPath = "/dickos/bin/dickfetch.lua",
         },
         {
             sourcePath = fs.combine(sourceRoot, "startup.lua"),
@@ -788,7 +793,7 @@ local function printSuccess(hostname, ownerUsername, machineID)
     print("Hostname:   " .. hostname)
     print("Owner:      " .. ownerUsername)
     print()
-    print("Stage-0, minimal init, and Recovery are installed.")
+    print("Stage-0, minimal init, Recovery, and dickfetch are installed.")
     print("Reboot or power on the computer to enter DICK/OS.")
     print()
     print("Authentication subsystem is not installed yet.")
@@ -839,7 +844,7 @@ local function runInstaller()
         return
     end
 
-    ok("Stage-0, init, and recovery source payload available")
+    ok("Stage-0, init, Recovery, and dickfetch source payload available")
 
     local capturedSettings, settingsCaptureError = captureBootSettings()
 
@@ -925,7 +930,7 @@ local function runInstaller()
 
     if not payloadSucceeded then
         reportDeploymentFailure(
-            "Unable to install Stage-0, init, or recovery.",
+            "Unable to install Stage-0, init, Recovery, or dickfetch.",
             payloadWriteError
         )
         return

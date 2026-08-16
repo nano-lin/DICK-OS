@@ -9,7 +9,20 @@ local RECOVERY_BORDER = colors.lightBlue
 local PRIMARY_TEXT = colors.white
 local WARNING_TEXT = colors.yellow
 
--- The sad mascot mirrors the happy ready-screen mascot while changing only
+-- CC:T's bytes 128 through 159 are native 2-by-3-cell drawing characters.
+-- Using them through `string.char` produces one terminal glyph per Lua byte;
+-- pasting UTF-8 box characters would instead produce several unrelated CC:T
+-- glyphs. Some shapes require foreground/background inversion because CC:T
+-- stores only one shape from each complementary pair.
+local BOX_HORIZONTAL = { character = string.char(140), invertColors = false }
+local BOX_VERTICAL_LEFT = { character = string.char(149), invertColors = false }
+local BOX_VERTICAL_RIGHT = { character = string.char(149), invertColors = true }
+local BOX_TOP_LEFT = { character = string.char(156), invertColors = false }
+local BOX_TOP_RIGHT = { character = string.char(147), invertColors = true }
+local BOX_BOTTOM_LEFT = { character = string.char(141), invertColors = false }
+local BOX_BOTTOM_RIGHT = { character = string.char(142), invertColors = false }
+
+-- The sad mascot mirrors the happy dickfetch mascot while changing only
 -- the face. A table of strings keeps the ASCII art compact and lets the draw
 -- helper place it one terminal row at a time with `ipairs`.
 local SAD_DICK = {
@@ -61,21 +74,49 @@ local function writeAt(x, y, text, color)
     term.write(clippedText)
 end
 
--- Draw a reliable ASCII border around the whole terminal. Clearing after the
--- blue background is selected fills the interior, while `+`, `-`, and `|`
--- mark corners and edges using characters available on every CC:T terminal.
+-- Write a native drawing glyph and restore the blue screen background.
+-- `count` allows horizontal runs to be emitted by one terminal write instead
+-- of moving the cursor for every character. Inverted entries exchange the
+-- foreground and background colours to reveal their complementary shape.
+local function writeBoxGlyphAt(x, y, glyph, count)
+    local terminalWidth, terminalHeight = term.getSize()
+
+    if x < 1 or x > terminalWidth or y < 1 or y > terminalHeight then
+        return
+    end
+
+    local repeatCount = math.min(count or 1, terminalWidth - x + 1)
+    local textColor = RECOVERY_BORDER
+    local backgroundColor = RECOVERY_BACKGROUND
+
+    if glyph.invertColors then
+        textColor, backgroundColor = backgroundColor, textColor
+    end
+
+    term.setTextColor(textColor)
+    term.setBackgroundColor(backgroundColor)
+    term.setCursorPos(x, y)
+    term.write(string.rep(glyph.character, repeatCount))
+    term.setBackgroundColor(RECOVERY_BACKGROUND)
+end
+
+-- Draw a native CC:T semigraphics border around the whole terminal. Clearing
+-- after the blue background is selected fills the interior; only the edge
+-- glyphs need to be written afterwards.
 local function drawBox()
     local terminalWidth, terminalHeight = term.getSize()
-    local horizontalEdge = "+" ..
-        string.rep("-", terminalWidth - 2) .. "+"
 
     prepareTerminal()
-    writeAt(1, 1, horizontalEdge, RECOVERY_BORDER)
-    writeAt(1, terminalHeight, horizontalEdge, RECOVERY_BORDER)
+    writeBoxGlyphAt(1, 1, BOX_TOP_LEFT)
+    writeBoxGlyphAt(2, 1, BOX_HORIZONTAL, terminalWidth - 2)
+    writeBoxGlyphAt(terminalWidth, 1, BOX_TOP_RIGHT)
+    writeBoxGlyphAt(1, terminalHeight, BOX_BOTTOM_LEFT)
+    writeBoxGlyphAt(2, terminalHeight, BOX_HORIZONTAL, terminalWidth - 2)
+    writeBoxGlyphAt(terminalWidth, terminalHeight, BOX_BOTTOM_RIGHT)
 
     for row = 2, terminalHeight - 1 do
-        writeAt(1, row, "|", RECOVERY_BORDER)
-        writeAt(terminalWidth, row, "|", RECOVERY_BORDER)
+        writeBoxGlyphAt(1, row, BOX_VERTICAL_LEFT)
+        writeBoxGlyphAt(terminalWidth, row, BOX_VERTICAL_RIGHT)
     end
 end
 
@@ -175,7 +216,7 @@ local function drawRecoveryScreen(notice)
     drawMascot(SAD_DICK, mascotX, 2, WARNING_TEXT)
 
     writeAt(3, 4, "Boot failure", WARNING_TEXT)
-    writeAt(3, 5, string.rep("-", diagnosticWidth), RECOVERY_BORDER)
+    writeBoxGlyphAt(3, 5, BOX_HORIZONTAL, diagnosticWidth)
     drawWrappedText(
         3,
         6,

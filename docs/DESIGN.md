@@ -277,9 +277,10 @@ install
 
 The current Milestone 2 development installer uses the repository as a local
 payload: it reads `src/startup.lua`, `src/dickos/system/init.lua`, and
-`src/dickos/system/recovery.lua` beside `install.lua`, then writes them to their
-installed paths after confirmation. A single-file download/bootstrap transport
-is not implemented yet and must not be confused with DickPkg or DickRepo.
+`src/dickos/system/recovery.lua`, and `src/dickos/bin/dickfetch.lua` beside
+`install.lua`, then writes them to their installed paths after confirmation. A
+single-file download/bootstrap transport is not implemented yet and must not be
+confused with DickPkg or DickRepo.
 
 Installer flow:
 
@@ -452,7 +453,7 @@ computers observe the same CC ID and filesystem, each computer sees internally
 consistent identity data. DICK/OS must not claim that the permanent machine ID
 alone proves that only one physical computer exists.
 
-## Future identity health model
+## Identity health model foundation
 
 The first future check is local identity consistency. DICK/OS can compare the
 current `os.getComputerID()` value with the CC ID encoded in the installed
@@ -469,13 +470,31 @@ This detects a filesystem copied or moved to a computer with a different CC
 ID. It cannot detect two physical computers which both expose the same CC ID
 and shared filesystem.
 
-The second future check is runtime/network duplicate detection. Each cold boot
-may generate a temporary best-effort Boot ID such as `B-5F921A`. A Boot ID:
+The second future check is runtime/network duplicate detection. Stage-0 now
+generates a temporary best-effort Boot ID in this exact format:
 
-- is regenerated for every boot execution;
-- is not a permanent machine identity;
-- is not a password, token, or security secret;
+```text
+B-XXXXXXXX
+```
+
+The eight suffix characters are uppercase hexadecimal. A Boot ID:
+
+- is generated exactly once when one Stage-0 chunk begins executing;
+- remains unchanged across Ctrl+T init restart, Recovery retry, and repeated
+  init attempts supervised by that Stage-0 execution;
+- changes when reboot, power-on, or another fresh CC:T startup executes
+  Stage-0 again;
+- exists only in a small runtime context passed from Stage-0 to init;
+- is never written to `/dickos`, `/.settings`, or another persistent path;
+- is best-effort uniqueness, not cryptographic identity;
+- is not a permanent machine identity, password, token, or security secret;
 - does not replace `/dickos/etc/machine-id`.
+
+Runtime-only lifetime is important when copied physical CC:T computers expose
+the same CC ID and persistent filesystem: a disk-backed Boot ID would also be
+shared or raced. Future services, the DICK shell, and DickNet may inherit this
+context when those components exist; Stage-0 is not a general runtime-state
+manager.
 
 A future DickNet node announcement may contain:
 
@@ -486,10 +505,13 @@ hostname
 boot_id
 ```
 
-If two simultaneously visible announcements contain the same machine ID but
-different Boot IDs, DICK/OS should report a possible `IDENTITY_CONFLICT`. This
-network mechanism is design foundation only; no Boot ID or DickNet duplicate
-detection is implemented in the current bootstrap.
+If two simultaneously-live announcements contain the same machine ID but
+different Boot IDs, DICK/OS should report a possible `IDENTITY_CONFLICT`.
+Future DickNet discovery must use liveness or heartbeat expiry before making
+that comparison. Otherwise an announcement left over from the previous boot
+could be mistaken for a second live machine and create a false conflict. Boot
+ID generation and init context passing are implemented; DickNet announcement,
+heartbeat, expiry, and duplicate detection are not.
 
 ---
 
@@ -515,6 +537,7 @@ Target installed layout:
     │   └── hardware.lua
     │
     ├── bin/
+    │   └── dickfetch.lua
     ├── services/
     │
     ├── etc/
@@ -581,6 +604,12 @@ Once CraftOS reaches local startup, every cold or fresh start creates a new
 execution state. CraftOS runs the installed `/startup.lua`, Stage-0 loads init,
 and persistent DICK/OS state is read again from `/dickos/etc` and `/dickos/var`
 as those subsystems become available.
+
+At the beginning of that Stage-0 execution, Stage-0 also creates one
+runtime-only Boot ID and passes it to every init attempt in a small context
+table. Supervisor retry does not execute startup.lua again, so it retains the
+same Boot ID. A fresh CraftOS startup executes Stage-0 again and creates a new
+one.
 
 If CraftOS reaches local startup and `/startup.lua` exists and remains
 syntactically executable, normal startup must lead either to the DICK/OS
@@ -670,14 +699,22 @@ init.lua a giant file.
 
 # 17. Boot presentation
 
-Normal DICK/OS boot uses a black background and begins with branded identity:
+Normal DICK/OS boot uses a black background and places the complete bootstrap
+presentation inside one native CC:T semigraphics frame. The title and tagline
+are centred inside the frame, followed by an internal TUI separator:
 
 ```text
-DICK/OS 0.1.0-unstable
----------------------------------------------------
-Distributed Infrastructure & Computer Kit
----------------------------------------------------
+              DICK/OS 0.1.0-unstable
+   Distributed Infrastructure & Computer Kit
+
+   <native internal separator>
 ```
+
+The implementation constructs single-byte drawing glyphs with `string.char`
+rather than embedding UTF-8 box characters which CC:T would render as multiple
+unrelated bytes. CC:T's drawing glyphs use foreground/background complements,
+so some corners and edges exchange those colours. Exact glyph alignment is a
+Minecraft runtime visual-verification item.
 
 The current minimal init then animates only real bootstrap stages:
 
@@ -698,14 +735,25 @@ generic boot framework. Authentication, integrity, services, drivers, dickd,
 DickNet, and package management must not appear as successful stages until
 those subsystems exist.
 
-After progress completes, init clears the screen and displays the small happy
-DICK/OS mascot beside the installed version, hostname, machine ID, and green
-`SYSTEM READY` state. The boot sequence intentionally has a retro Unix/DOS
-appearance.
+After progress completes, init clears the framed boot screen and invokes
+`/dickos/bin/dickfetch.lua`. Dickfetch is the canonical compact post-boot
+system-information presentation: the happy DICK/OS mascot begins at the same
+vertical level as the title, followed in order by version, hostname, machine
+ID, runtime Boot ID, and green `SYSTEM READY` state. It has no giant frame,
+underline, or bootstrap-placeholder text.
 
-The ready screen is the future session handoff point. Until a real DICK shell
-or session subsystem exists, minimal init remains in its event wait-loop. It
-must not provide a fake shell or fake commands merely to fill that space.
+Init passes dickfetch one explicit table containing `version`, `hostname`,
+`machineID`, and `bootID`. The utility does not persist Boot ID or reconstruct
+it from the filesystem. A future DICK shell should invoke the same utility with
+the current runtime context; the shell itself is not implemented. Missing
+required metadata remains an init failure, while a missing, invalid, or
+crashing dickfetch is a noncritical presentation failure: init displays a
+minimal identity/status fallback and remains in its event wait-loop rather
+than entering Recovery.
+
+This post-boot presentation is the future session handoff point. Until a real
+DICK shell or session subsystem exists, minimal init remains in that wait-loop.
+It must not provide fake commands merely to fill the space.
 
 ---
 
@@ -998,7 +1046,7 @@ A pixel-based graphical desktop is not required for 0.1.0.
 Full DICK/OS targets the Advanced Computer colour terminal. The three boot
 states must be immediately distinguishable:
 
-- normal DICK/OS: black background;
+- normal DICK/OS: black background and one boxed boot TUI;
 - DICK/OS Recovery: blue boxed TUI;
 - Emergency Fallback: red boxed TUI.
 
@@ -1145,9 +1193,13 @@ Nodes may advertise:
 - machine ID
 - hostname
 - CC ID
+- the current runtime Boot ID
 - DickNet protocol version
 
 Machine ID is the primary persistent DICK/OS identity.
+Boot ID is transient and may only support duplicate detection while its node
+announcement remains live. Future DickNet heartbeat/liveness expiry must remove
+stale Boot IDs before comparing simultaneous announcements.
 
 ---
 
@@ -1456,8 +1508,10 @@ FAILED
 
 # 47. Recovery environment
 
-The current bootstrap Recovery is a blue full-screen boxed TUI. It displays a
-sad mascot, wraps the boot diagnostic so the menu remains visible, and offers:
+The current bootstrap Recovery is a blue full-screen boxed TUI using the same
+native CC:T semigraphics family as Normal Boot. It displays a sad mascot, keeps
+the title / failure heading / separator / diagnostic / menu hierarchy, wraps
+the boot diagnostic so the menu remains visible, and offers:
 
 ```text
 DICK/OS RECOVERY
@@ -1472,12 +1526,14 @@ CraftOS rescue shell is explicitly selected.
 
 It is not an accidental fallback.
 
-If Recovery itself is missing or fails, Stage-0 displays a red boxed Emergency
-Fallback with the sad mascot, Recovery failure, original boot failure, and the
-same four survival actions. Its minimal drawing, wrapping, colour, mascot, and
-input logic remain self-contained inside `/startup.lua`. This small duplication
-is intentional: the last-resort path cannot depend on init, Recovery, or a
-shared DICK/OS UI library which may be unavailable.
+If Recovery itself is missing or fails, Stage-0 displays a red native-framed
+Emergency Fallback with the sad mascot. Its title is followed by spaced
+`CRITICAL BOOT FAILURE` severity, an internal separator, Recovery failure,
+original boot failure, and the same four survival actions. Its minimal drawing,
+wrapping, colour, mascot, and input logic remain self-contained inside
+`/startup.lua`. This small duplication is intentional: the last-resort path
+cannot depend on init, Recovery, or a shared DICK/OS UI library which may be
+unavailable.
 
 Future integrity verification, restore, and reinstall actions may extend the
 real Recovery environment only after those capabilities exist. The bootstrap
