@@ -5,7 +5,9 @@ local VERSION_PATH = "/dickos/etc/version"
 local HOSTNAME_PATH = "/dickos/etc/hostname"
 local MACHINE_ID_PATH = "/dickos/etc/machine-id"
 local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
+local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 local STAGE0_RESTART_RESULT = "restart"
+local EXPECTED_RUNTIME_API_VERSION = 1
 
 -- Full DICK/OS supports the Advanced Computer, so its colour terminal is a
 -- platform baseline rather than an optional skin. These constants begin a
@@ -41,6 +43,63 @@ local BOOT_FRAME_DELAY = 0.05
 -- Init reads its Boot ID but does not turn that table into a general state
 -- manager and never persists it.
 local runtimeContext = ...
+
+-- Load the normal logger behind one complete protected boundary. `loadfile`
+-- compiles the module, its returned function executes the module, and
+-- `logModule.create` makes the context-bound logger. All three steps, including
+-- table access on a malformed replacement module, remain inside `pcall`.
+-- Returning nil on any problem turns every later log request into a no-op:
+-- diagnostics must never be the reason init enters Recovery.
+local function createBestEffortLogger(targetName, context)
+    local constructionSucceeded, logger = pcall(function()
+        local loggerProgram = loadfile(LOG_LIBRARY_PATH)
+
+        if type(loggerProgram) ~= "function" then
+            return nil
+        end
+
+        local logModule = loggerProgram()
+
+        if type(logModule) ~= "table" or
+            type(logModule.create) ~= "function" then
+            return nil
+        end
+
+        local createdLogger = logModule.create(targetName, context)
+
+        if type(createdLogger) ~= "table" then
+            return nil
+        end
+
+        return createdLogger
+    end)
+
+    if not constructionSucceeded then
+        return nil
+    end
+
+    return logger
+end
+
+-- Call one level method without trusting either the module or the filesystem.
+-- Indexing and invoking the logger happen inside `pcall`, so even a malformed
+-- replacement module cannot turn a best-effort diagnostic into boot failure.
+local function logBestEffort(logger, level, component, message)
+    if logger == nil then
+        return
+    end
+
+    pcall(function()
+        local levelMethod = logger[level]
+
+        if type(levelMethod) == "function" then
+            levelMethod(component, message)
+        end
+    end)
+end
+
+local bootLogger = createBestEffortLogger("boot", runtimeContext)
+local systemLogger = createBestEffortLogger("system", runtimeContext)
 
 -- Each stage is a small Lua table containing the text shown to the user and
 -- its current visual state. This is enough structure for later init work to
@@ -194,15 +253,40 @@ local function requireValue(path, description)
     return value
 end
 
--- Validate the per-boot value supplied by Stage-0.
+-- Validate the small runtime API supplied by Stage-0.
 --
--- The exact pattern makes accidental interface breakage a real init failure:
--- `B-` must be followed by eight uppercase hexadecimal characters. This value
--- cannot be recovered from disk by design, so a missing or malformed runtime
--- context means the required live identity is unavailable.
-local function requireBootID(context)
+-- `apiVersion` is a compatibility marker, not a negotiation protocol. Init
+-- accepts exactly the interface it understands and reports both expected and
+-- received values when they differ. The Boot ID pattern then requires `B-`
+-- followed by eight uppercase hexadecimal characters. Neither value can be
+-- reconstructed from disk, so an invalid context is a real init failure.
+-- Every rejection is logged before `error` returns it to Stage-0, but the
+-- protected logging wrapper means a logger failure cannot hide that real error.
+local function requireRuntimeContext(context)
     if type(context) ~= "table" then
-        error("Stage-0 did not supply the runtime context.", 0)
+        local contextError =
+            "Runtime context missing. Expected Stage-0 runtime API 1."
+
+        logBestEffort(bootLogger, "error", "init", contextError)
+        error(contextError, 0)
+    end
+
+    logBestEffort(
+        bootLogger,
+        "info",
+        "init",
+        "Runtime context received"
+    )
+
+    if context.apiVersion ~= EXPECTED_RUNTIME_API_VERSION then
+        local contextError = string.format(
+            "Unsupported Stage-0 runtime API. Expected: %d Received: %s",
+            EXPECTED_RUNTIME_API_VERSION,
+            tostring(context.apiVersion)
+        )
+
+        logBestEffort(bootLogger, "error", "init", contextError)
+        error(contextError, 0)
     end
 
     local bootID = context.bootID
@@ -212,9 +296,14 @@ local function requireBootID(context)
         "^B%-[0-9A-F][0-9A-F][0-9A-F][0-9A-F]" ..
             "[0-9A-F][0-9A-F][0-9A-F][0-9A-F]$"
     ) then
-        error("Stage-0 supplied an invalid Boot ID.", 0)
+        local contextError =
+            "Stage-0 runtime context contains an invalid Boot ID."
+
+        logBestEffort(bootLogger, "error", "init", contextError)
+        error(contextError, 0)
     end
 
+    logBestEffort(bootLogger, "info", "init", "Boot ID validated")
     return bootID
 end
 
@@ -394,15 +483,26 @@ local function drawDickfetchFallback(context, presentationError)
 end
 
 prepareTerminal()
+logBestEffort(bootLogger, "info", "init", "init started")
 
+local bootID = requireRuntimeContext(runtimeContext)
 local version = requireValue(VERSION_PATH, "DICK/OS version")
+logBestEffort(bootLogger, "info", "init", "Version metadata loaded")
 local hostname = requireValue(HOSTNAME_PATH, "hostname")
+logBestEffort(bootLogger, "info", "init", "Hostname metadata loaded")
 local machineID = requireValue(MACHINE_ID_PATH, "machine ID")
-local bootID = requireBootID(runtimeContext)
+logBestEffort(bootLogger, "info", "init", "Machine ID metadata loaded")
 
+logBestEffort(bootLogger, "info", "init", "Normal boot UI starting")
 drawBootHeader(version)
 
 if not animateBootProgress() then
+    logBestEffort(
+        bootLogger,
+        "warn",
+        "init",
+        "Terminate event received during boot UI; requesting init restart"
+    )
     return STAGE0_RESTART_RESULT
 end
 
@@ -415,11 +515,21 @@ local dickfetchContext = {
     machineID = machineID,
     bootID = bootID,
 }
+logBestEffort(bootLogger, "info", "init", "dickfetch starting")
 local presentationSucceeded, presentationError = runDickfetch(dickfetchContext)
 
 if not presentationSucceeded then
+    logBestEffort(
+        bootLogger,
+        "warn",
+        "dickfetch",
+        "Presentation failure: " .. tostring(presentationError)
+    )
     drawDickfetchFallback(dickfetchContext, presentationError)
 end
+
+logBestEffort(bootLogger, "info", "init", "Bootstrap session ready")
+logBestEffort(systemLogger, "info", "init", "Bootstrap session ready")
 
 -- This point is the deliberate future session handoff. A later milestone may
 -- replace the bootstrap wait-loop below with a real DICK shell/session entry
@@ -434,6 +544,11 @@ while true do
     local eventName = os.pullEventRaw()
 
     if eventName == "terminate" then
+        local restartMessage =
+            "Terminate event received; requesting init restart"
+
+        logBestEffort(bootLogger, "warn", "init", restartMessage)
+        logBestEffort(systemLogger, "warn", "init", restartMessage)
         return STAGE0_RESTART_RESULT
     end
 end

@@ -275,12 +275,13 @@ Future intended usage may resemble:
 wget <URL> install.lua
 install
 
-The current Milestone 2 development installer uses the repository as a local
-payload: it reads `src/startup.lua`, `src/dickos/system/init.lua`, and
-`src/dickos/system/recovery.lua`, and `src/dickos/bin/dickfetch.lua` beside
-`install.lua`, then writes them to their installed paths after confirmation. A
-single-file download/bootstrap transport is not implemented yet and must not be
-confused with DickPkg or DickRepo.
+The current development installer uses the repository as a local payload: it
+reads `src/startup.lua`, `src/dickos/system/init.lua`,
+`src/dickos/system/recovery.lua`, `src/dickos/lib/log.lua`,
+`src/dickos/bin/dickfetch.lua`, and `src/dickos/bin/dicklog.lua` beside
+`install.lua`, then writes them to their installed paths after confirmation.
+The installer writes Stage-0 last. A single-file download/bootstrap transport
+is not implemented yet and must not be confused with DickPkg or DickRepo.
 
 Installer flow:
 
@@ -490,6 +491,22 @@ The eight suffix characters are uppercase hexadecimal. A Boot ID:
 - is not a permanent machine identity, password, token, or security secret;
 - does not replace `/dickos/etc/machine-id`.
 
+The current runtime-context contract is deliberately small:
+
+```lua
+{
+    apiVersion = 1,
+    bootID = "B-XXXXXXXX",
+}
+```
+
+Stage-0 owns this table and passes the same instance to init attempts and to
+Recovery during one supervisor execution. `apiVersion` is an exact
+compatibility marker: init accepts version 1, rejects a missing or unsupported
+version with a clear boot error, and does not attempt protocol negotiation.
+The marker versions only this runtime table; it is independent from the
+DICK/OS release version and future network protocol versions.
+
 Runtime-only lifetime is important when copied physical CC:T computers expose
 the same CC ID and persistent filesystem: a disk-backed Boot ID would also be
 shared or raced. Future services, the DICK shell, and DickNet may inherit this
@@ -529,6 +546,7 @@ Target installed layout:
     │   └── recovery.lua
     │
     ├── lib/
+    │   ├── log.lua
     │   ├── config.lua
     │   ├── auth.lua
     │   ├── integrity.lua
@@ -537,7 +555,8 @@ Target installed layout:
     │   └── hardware.lua
     │
     ├── bin/
-    │   └── dickfetch.lua
+    │   ├── dickfetch.lua
+    │   └── dicklog.lua
     ├── services/
     │
     ├── etc/
@@ -609,7 +628,14 @@ At the beginning of that Stage-0 execution, Stage-0 also creates one
 runtime-only Boot ID and passes it to every init attempt in a small context
 table. Supervisor retry does not execute startup.lua again, so it retains the
 same Boot ID. A fresh CraftOS startup executes Stage-0 again and creates a new
-one.
+one. The context currently has runtime API version 1; init validates both that
+version and the Boot ID format before continuing normal bootstrap.
+
+Stage-0 also has a tiny self-contained best-effort append helper for
+`/dickos/var/log/boot.log`. It must not load `/dickos/lib/log.lua`, because a
+missing or damaged normal library cannot be allowed to disable boot supervision
+or Emergency Fallback. Any Stage-0 logging or rotation failure is ignored after
+the attempted write and does not replace the real boot error.
 
 If CraftOS reaches local startup and `/startup.lua` exists and remains
 syntactically executable, normal startup must lead either to the DICK/OS
@@ -1445,18 +1471,62 @@ services without being DICK/OS internally.
 
 # 44. Logging
 
-Initial logs:
+The currently implemented logs are:
 
 /dickos/var/log/boot.log
 /dickos/var/log/system.log
-/dickos/var/log/auth.log
-/dickos/var/log/dicknet.log
 
-Logs must be bounded.
+Normal init and Recovery components use `/dickos/lib/log.lua`. The module
+creates an explicit logger bound to one log target and one runtime context; it
+does not keep mutable global Boot ID state. Stage-0 and Emergency Fallback do
+not depend on this module and use Stage-0's smaller autonomous append helper.
 
-Do not allow unlimited files to consume the computer's storage.
+Ordinary records contain one event per physical line:
 
-Avoid unnecessary writes every tick.
+```text
+2026-08-16T20:14:32Z [B-7C4A91E2] [INFO] [stage0] Stage-0 started
+```
+
+The fields are UTC timestamp, Boot ID, level, component, and message. Embedded
+line breaks in values are replaced with a visible separator so one error cannot
+imitate several records. Logs must not contain passwords or other secrets.
+
+Current levels are:
+
+- `DEBUG`: detailed diagnostic progress;
+- `INFO`: expected lifecycle state;
+- `WARN`: degraded or user-selected exceptional state;
+- `ERROR`: one operation or component failed;
+- `CRITICAL`: supervision or recovery reached a last-resort failure path.
+
+`boot.log` contains fresh Stage-0 boot markers, supervisor attempts, init
+progress, Recovery decisions, and fallback transitions. Its Boot ID groups
+Ctrl+T init restarts and Recovery retries under the same Stage-0 execution. A
+new Stage-0 execution appends a new marker and normally has a new Boot ID.
+`system.log` begins the longer-lived system/session diagnostic stream; the
+minimal init currently records bootstrap-session readiness and terminate-driven
+restart there.
+
+Both files are bounded before appending a record which would cross their limit:
+
+- `boot.log`: 64 KiB;
+- `system.log`: 128 KiB.
+
+The current file is moved to `<name>.1`, an older `.1` is removed, and only one
+rotated file is retained. There is no archive manager. Open, timestamp,
+rotation, write, and close errors are all best-effort failures: logger failure
+must never cause init to enter Recovery or prevent Recovery/Fallback actions.
+
+`/dickos/bin/dicklog.lua` is the small current viewer. With no arguments it
+shows the last 20 active `boot.log` lines. It also accepts `boot`, `system`, and
+a positive line count, for example `dicklog boot 50`. It intentionally has no
+search, filter, or archive framework yet and can be run directly by path from a
+CraftOS rescue shell.
+
+Future `/dickos/var/log/auth.log` and `/dickos/var/log/dicknet.log` remain
+planned. They are not created until their corresponding subsystems exist.
+
+Logging occurs on meaningful state transitions, not every timer tick.
 
 ---
 

@@ -6,6 +6,15 @@
 -- networking, hardware discovery, and the future shell belong below init.
 local INIT_PATH = "/dickos/system/init.lua"
 local RECOVERY_PATH = "/dickos/system/recovery.lua"
+local BOOT_LOG_PATH = "/dickos/var/log/boot.log"
+local BOOT_LOG_MAXIMUM_BYTES = 64 * 1024
+local RUNTIME_CONTEXT_API_VERSION = 1
+
+-- This forward declaration lets the autonomous logging closure see the one
+-- context table assigned after Boot ID generation. Stage-0 does not call the
+-- logger before that assignment. Supervisor functions still receive the table
+-- explicitly so its retry lifetime remains visible in normal control flow.
+local runtimeContext
 
 local INIT_RESTART_RESULT = "restart"
 local RECOVERY_RETRY_RESULT = "retry"
@@ -34,6 +43,116 @@ local BOX_TOP_RIGHT = { character = string.char(147), invertColors = true }
 local BOX_BOTTOM_LEFT = { character = string.char(141), invertColors = false }
 local BOX_BOTTOM_RIGHT = { character = string.char(142), invertColors = false }
 
+-- Stage-0 deliberately does not load `/dickos/lib/log.lua`. Init, Recovery,
+-- or that library may be missing or damaged, and the last-resort supervisor
+-- must remain able to report the original boot failure. This small duplicate
+-- append path is therefore an architectural reliability boundary, not a
+-- general logging subsystem hidden inside startup.lua.
+
+-- Replace record-breaking characters before writing a one-line event. Lua's
+-- `string.gsub` returns the modified string (and also a replacement count,
+-- which this assignment intentionally ignores). Preserving the remaining text
+-- keeps low-level error details useful without letting one error resemble
+-- several log records.
+local function sanitizeLogField(value)
+    local text = tostring(value)
+
+    return string.gsub(text, "[\r\n]+", " | ")
+end
+
+-- Convert CC:T's UTC epoch milliseconds into the ISO-like timestamp used by
+-- normal DICK/OS logs. `os.date` accepts seconds, so the epoch value is divided
+-- by 1000. The `!` prefix explicitly selects UTC rather than server-local time.
+local function currentUTCTimestamp()
+    local epochSeconds = os.epoch("utc") / 1000
+
+    return os.date("!%Y-%m-%dT%H:%M:%SZ", epochSeconds)
+end
+
+-- Append raw marker or record text to boot.log with one bounded `.1` file.
+--
+-- Every filesystem operation is inside `pcall`. A protected call returns a
+-- boolean instead of allowing an error to escape, and that result is
+-- intentionally ignored here: missing directories, a full disk, rotation
+-- failure, and write failure must not change Stage-0 control flow. The active
+-- log is rotated before this append would exceed 64 KiB.
+local function appendStage0LogText(text)
+    pcall(function()
+        local contents = tostring(text)
+        local truncationSuffix = "[TRUNCATED]\n"
+
+        -- A single Lua error may contain arbitrarily long text. Limit that one
+        -- append too, otherwise a record larger than 64 KiB could defeat file
+        -- rotation by filling a new active log on its own.
+        if #contents > BOOT_LOG_MAXIMUM_BYTES then
+            local retainedBytes =
+                BOOT_LOG_MAXIMUM_BYTES - #truncationSuffix
+
+            contents = string.sub(contents, 1, retainedBytes) ..
+                truncationSuffix
+        end
+
+        if fs.exists(BOOT_LOG_PATH) and
+            fs.getSize(BOOT_LOG_PATH) + #contents >
+                BOOT_LOG_MAXIMUM_BYTES then
+            local rotatedPath = BOOT_LOG_PATH .. ".1"
+
+            if fs.exists(rotatedPath) then
+                fs.delete(rotatedPath)
+            end
+
+            fs.move(BOOT_LOG_PATH, rotatedPath)
+        end
+
+        local file = fs.open(BOOT_LOG_PATH, "a")
+
+        if file == nil then
+            return
+        end
+
+        pcall(file.write, contents)
+        pcall(file.close)
+    end)
+end
+
+-- Write one standard Stage-0 event. This function is protected separately
+-- from the append helper because timestamp or string formatting can also fail;
+-- logging remains disposable while boot supervision remains authoritative.
+local function stage0Log(level, component, message)
+    pcall(function()
+        local record = string.format(
+            "%s [%s] [%s] [%s] %s\n",
+            currentUTCTimestamp(),
+            sanitizeLogField(runtimeContext and runtimeContext.bootID or
+                "UNKNOWN"),
+            sanitizeLogField(level),
+            sanitizeLogField(component),
+            sanitizeLogField(message)
+        )
+
+        appendStage0LogText(record)
+    end)
+end
+
+-- A marker is emitted once per execution of startup.lua, outside every retry
+-- loop. Init restarts and Recovery retries therefore add records beneath the
+-- same marker and keep the same Boot ID. A fresh CraftOS startup executes this
+-- chunk again and appends a new marker.
+local function appendBootMarker(bootID)
+    pcall(function()
+        local marker = table.concat({
+            "==================================================",
+            "BOOT START",
+            "Boot ID: " .. sanitizeLogField(bootID),
+            "CC ID: " .. sanitizeLogField(os.getComputerID()),
+            "==================================================",
+            "",
+        }, "\n")
+
+        appendStage0LogText(marker)
+    end)
+end
+
 -- Generate one temporary identity for this execution of Stage-0.
 --
 -- A seed is the starting value from which Lua's pseudo-random number generator
@@ -42,6 +161,12 @@ local BOX_BOTTOM_RIGHT = { character = string.char(142), invertColors = false }
 -- sequence left behind by CraftOS or another startup program. UTC epoch time
 -- changes between ordinary starts, while the CC computer ID helps separate
 -- computers which start at nearly the same moment.
+--
+-- Calling `math.randomseed` also changes Lua's process-wide random sequence.
+-- Lua does not expose a separate standard generator object which could be
+-- seeded locally. No current Stage-0 or init behaviour depends on preserving
+-- the earlier sequence, so this known side effect is retained rather than
+-- adding a custom pseudo-random generator during a narrow regression fix.
 --
 -- This is not cryptographic protection: the inputs are observable, the
 -- generator is predictable, and collisions remain possible. A Boot ID is only
@@ -73,9 +198,18 @@ end
 -- is passed to every init attempt made by this supervisor execution, so retry
 -- and Ctrl+T restart preserve the Boot ID. It is deliberately never written
 -- to the filesystem or settings; a fresh Stage-0 execution creates a new one.
-local runtimeContext = {
+runtimeContext = {
+    apiVersion = RUNTIME_CONTEXT_API_VERSION,
     bootID = generateBootID(),
 }
+
+appendBootMarker(runtimeContext.bootID)
+stage0Log("INFO", "stage0", "Stage-0 started")
+stage0Log(
+    "INFO",
+    "stage0",
+    "Generated Boot ID " .. runtimeContext.bootID
+)
 
 -- Emergency Fallback cannot load branding from init, Recovery, or a future UI
 -- library because those components may be the reason boot failed. Its compact
@@ -142,23 +276,43 @@ end
 -- Ctrl+T path returns `restart`, while every other normal return is considered
 -- unexpected. The supervisor loop consumes these states without recursively
 -- launching another startup.lua, so repeated retries cannot grow Lua's call
--- stack forever.
-local function attemptNormalBoot()
+-- stack forever. `runtimeContext` is the table received from the supervisor;
+-- this function forwards that exact table to init without copying or changing
+-- its Boot ID.
+local function attemptNormalBoot(runtimeContext, attemptNumber)
+    stage0Log(
+        "INFO",
+        "stage0",
+        "Loading init for normal boot attempt " ..
+            tostring(attemptNumber) .. ": " .. INIT_PATH
+    )
+
     if not fs.exists(INIT_PATH) then
-        return "recovery", "Required init is missing: " .. INIT_PATH
+        local failureReason = "Required init is missing: " .. INIT_PATH
+
+        stage0Log("ERROR", "stage0", failureReason)
+        return "recovery", failureReason
     end
 
     local initSucceeded, initResult = runProtected(INIT_PATH, runtimeContext)
 
     if not initSucceeded then
-        return "recovery", "init crashed: " .. describeError(initResult)
+        local failureReason = "init crashed: " .. describeError(initResult)
+
+        stage0Log("ERROR", "stage0", failureReason)
+        return "recovery", failureReason
     end
 
     if initResult == INIT_RESTART_RESULT then
+        stage0Log("INFO", "stage0", "init returned restart")
         return "restart", nil
     end
 
-    return "recovery", "init returned unexpectedly without reboot or shutdown."
+    local failureReason =
+        "init returned unexpectedly without reboot or shutdown."
+
+    stage0Log("ERROR", "stage0", failureReason)
+    return "recovery", failureReason
 end
 
 -- The helpers below deliberately duplicate a small amount of Recovery UI
@@ -419,6 +573,7 @@ local function runEmergencyFallback(
         local choice, inputError = readFallbackInput("Select: ")
 
         if choice == "1" then
+            stage0Log("WARN", "fallback", "Emergency Fallback retry selected")
             return RECOVERY_RETRY_RESULT
         elseif choice == "2" then
             drawEmergencyFallbackScreen(
@@ -435,6 +590,11 @@ local function runEmergencyFallback(
                 confirmation = string.lower(confirmation)
 
                 if confirmation == "y" or confirmation == "yes" then
+                    stage0Log(
+                        "WARN",
+                        "fallback",
+                        "Emergency Fallback CraftOS rescue selected"
+                    )
                     return RECOVERY_RESCUE_RESULT
                 end
 
@@ -444,8 +604,10 @@ local function runEmergencyFallback(
                     describeError(confirmationError)
             end
         elseif choice == "3" then
+            stage0Log("WARN", "fallback", "Reboot requested")
             os.reboot()
         elseif choice == "4" then
+            stage0Log("WARN", "fallback", "Shutdown requested")
             os.shutdown()
         elseif choice ~= nil then
             notice = "Unknown selection. Choose 1, 2, 3, or 4."
@@ -459,46 +621,99 @@ end
 -- Run Recovery under the same protection as init.
 -- Missing, crashing, or unexpectedly returning recovery code cannot make
 -- startup.lua finish. Those paths enter the built-in emergency fallback.
-local function requestRecovery(bootFailureReason)
+local function requestRecovery(bootFailureReason, runtimeContext)
     if not fs.exists(RECOVERY_PATH) then
+        local recoveryFailureReason =
+            "Required recovery program is missing: " .. RECOVERY_PATH
+
+        stage0Log("ERROR", "stage0", recoveryFailureReason)
+        stage0Log(
+            "CRITICAL",
+            "stage0",
+            "Transitioning to Emergency Fallback"
+        )
         return runEmergencyFallback(
-            "Required recovery program is missing: " .. RECOVERY_PATH,
+            recoveryFailureReason,
             bootFailureReason
         )
     end
 
     local recoverySucceeded, recoveryResult = runProtected(
         RECOVERY_PATH,
-        bootFailureReason
+        bootFailureReason,
+        runtimeContext
     )
 
     if not recoverySucceeded then
+        local recoveryFailureReason =
+            "recovery.lua crashed: " .. describeError(recoveryResult)
+
+        stage0Log("ERROR", "stage0", recoveryFailureReason)
+        stage0Log(
+            "CRITICAL",
+            "stage0",
+            "Transitioning to Emergency Fallback"
+        )
         return runEmergencyFallback(
-            "recovery.lua crashed: " .. describeError(recoveryResult),
+            recoveryFailureReason,
             bootFailureReason
         )
     end
 
-    if recoveryResult == RECOVERY_RETRY_RESULT or
-        recoveryResult == RECOVERY_RESCUE_RESULT then
+    if recoveryResult == RECOVERY_RETRY_RESULT then
+        stage0Log("WARN", "stage0", "Recovery requested normal boot retry")
         return recoveryResult
     end
 
-    return runEmergencyFallback(
+    if recoveryResult == RECOVERY_RESCUE_RESULT then
+        stage0Log("WARN", "stage0", "Recovery requested CraftOS rescue")
+        return recoveryResult
+    end
+
+    local recoveryFailureReason =
         "recovery.lua returned an invalid result: " ..
-            describeError(recoveryResult),
+            describeError(recoveryResult)
+
+    stage0Log("ERROR", "stage0", recoveryFailureReason)
+    stage0Log(
+        "CRITICAL",
+        "stage0",
+        "Transitioning to Emergency Fallback"
+    )
+    return runEmergencyFallback(
+        recoveryFailureReason,
         bootFailureReason
     )
 end
 
 -- Supervise normal boot for as long as DICK/OS owns the machine.
 -- Each pass through this loop is a fresh init attempt. A retry changes loop
--- state; it does not call Stage-0 again and therefore is not recursive.
-local function superviseBoot()
+-- state; it does not call Stage-0 again and therefore is not recursive. The
+-- context argument is the one table created above; passing it explicitly
+-- makes its lifetime visible through every supervisor call instead of relying
+-- on a hidden closure over Stage-0 state.
+local function superviseBoot(runtimeContext)
+    local normalBootAttempt = 0
+
     while true do
-        local bootState, bootFailureReason = attemptNormalBoot()
+        normalBootAttempt = normalBootAttempt + 1
+        stage0Log(
+            "INFO",
+            "stage0",
+            "Normal boot attempt " .. tostring(normalBootAttempt)
+        )
+
+        local bootState, bootFailureReason = attemptNormalBoot(
+            runtimeContext,
+            normalBootAttempt
+        )
 
         if bootState ~= "restart" then
+            stage0Log(
+                "WARN",
+                "stage0",
+                "Transitioning to Recovery: " .. tostring(bootFailureReason)
+            )
             prepareTerminal()
             print("DICK/OS Stage-0")
             print()
@@ -507,7 +722,10 @@ local function superviseBoot()
             print()
             print("Entering recovery...")
 
-            local recoveryResult = requestRecovery(bootFailureReason)
+            local recoveryResult = requestRecovery(
+                bootFailureReason,
+                runtimeContext
+            )
 
             if recoveryResult == RECOVERY_RESCUE_RESULT then
                 -- This return is intentional. The user explicitly selected the
@@ -523,15 +741,27 @@ end
 -- in Stage-0 must still lead to an emergency screen instead of an accidental
 -- CraftOS prompt. Selecting retry starts a new loop iteration, not recursion.
 while true do
-    local supervisorSucceeded, supervisorError = pcall(superviseBoot)
+    local supervisorSucceeded, supervisorError = pcall(
+        superviseBoot,
+        runtimeContext
+    )
 
     if supervisorSucceeded then
         -- `superviseBoot` returns normally only after explicit rescue choice.
         return
     end
 
-    local fallbackResult = runEmergencyFallback(
+    local supervisorFailureReason =
         "Stage-0 internal failure: " .. describeError(supervisorError)
+
+    stage0Log("CRITICAL", "stage0", supervisorFailureReason)
+    stage0Log(
+        "CRITICAL",
+        "stage0",
+        "Transitioning to Emergency Fallback"
+    )
+    local fallbackResult = runEmergencyFallback(
+        supervisorFailureReason
     )
 
     if fallbackResult == RECOVERY_RESCUE_RESULT then

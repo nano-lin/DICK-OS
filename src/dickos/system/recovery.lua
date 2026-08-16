@@ -3,6 +3,7 @@
 
 local RETRY_RESULT = "retry"
 local RESCUE_RESULT = "rescue"
+local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 
 local RECOVERY_BACKGROUND = colors.blue
 local RECOVERY_BORDER = colors.lightBlue
@@ -35,17 +36,81 @@ local SAD_DICK = {
 }
 
 -- A top-level Lua program receives arguments through `...`. Stage-0 passes the
--- boot-failure reason as the first argument when it calls this file's compiled
--- chunk. nil means no value was supplied; converting that case into explicit
--- text keeps the recovery screen useful instead of causing a concatenation
--- error.
-local bootFailureReason = ...
+-- boot-failure reason first and its runtime context second when it calls this
+-- file's compiled chunk. Lua assigns those multiple values to the two locals
+-- in order. nil means no failure reason was supplied; converting that case
+-- into explicit text keeps the screen useful instead of causing concatenation
+-- errors.
+local bootFailureReason, runtimeContext = ...
 
 if bootFailureReason == nil then
     bootFailureReason = "No boot-failure reason was supplied."
 else
     bootFailureReason = tostring(bootFailureReason)
 end
+
+-- Recovery uses the normal logger when it is healthy, but never relies on it.
+-- Module loading, execution, table access, and logger construction all remain
+-- inside one `pcall`, so a missing, malformed, or crashing log.lua only returns
+-- nil. Recovery must keep offering survival actions even when persistent
+-- diagnostics are unavailable.
+local function createBestEffortLogger(context)
+    local constructionSucceeded, logger = pcall(function()
+        local loggerProgram = loadfile(LOG_LIBRARY_PATH)
+
+        if type(loggerProgram) ~= "function" then
+            return nil
+        end
+
+        local logModule = loggerProgram()
+
+        if type(logModule) ~= "table" or
+            type(logModule.create) ~= "function" then
+            return nil
+        end
+
+        local createdLogger = logModule.create("boot", context)
+
+        if type(createdLogger) ~= "table" then
+            return nil
+        end
+
+        return createdLogger
+    end)
+
+    if not constructionSucceeded then
+        return nil
+    end
+
+    return logger
+end
+
+-- Invoke a selected level inside one more protected call. This guard covers a
+-- syntactically valid replacement logger whose returned object behaves badly;
+-- no logger implementation is allowed to break the Recovery menu.
+local function logBestEffort(logger, level, component, message)
+    if logger == nil then
+        return
+    end
+
+    pcall(function()
+        local levelMethod = logger[level]
+
+        if type(levelMethod) == "function" then
+            levelMethod(component, message)
+        end
+    end)
+end
+
+local bootLogger = createBestEffortLogger(runtimeContext)
+
+logBestEffort(bootLogger, "warn", "recovery", "Recovery entered")
+logBestEffort(
+    bootLogger,
+    "error",
+    "recovery",
+    "Original boot failure: " .. bootFailureReason
+)
 
 local function prepareTerminal()
     term.setBackgroundColor(RECOVERY_BACKGROUND)
@@ -273,9 +338,16 @@ while true do
     local choice = readRecoveryInput("Select: ")
 
     if choice == "1" then
+        logBestEffort(bootLogger, "warn", "recovery", "Retry selected")
         return RETRY_RESULT
     elseif choice == "2" then
         if confirmCraftOSRescue() then
+            logBestEffort(
+                bootLogger,
+                "warn",
+                "recovery",
+                "CraftOS rescue selected"
+            )
             return RESCUE_RESULT
         end
 
@@ -284,8 +356,10 @@ while true do
         -- These CC:T calls immediately change the computer's power state.
         -- Stage-0 does not intercept them. A reboot starts again at startup.lua;
         -- a shutdown executes no more Lua until the computer is powered on.
+        logBestEffort(bootLogger, "warn", "recovery", "Reboot selected")
         os.reboot()
     elseif choice == "4" then
+        logBestEffort(bootLogger, "warn", "recovery", "Shutdown selected")
         os.shutdown()
     else
         notice = "Unknown selection. Choose 1, 2, 3, or 4."
