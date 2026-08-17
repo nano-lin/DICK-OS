@@ -1021,10 +1021,13 @@ path from the DICK cwd/home first, then loads the real ROM editor at
 environment exposes only `shell.resolve` from the shell-shaped API and binds it
 to the already absolute DICK path. It deliberately omits `openTab` and
 `switchTab`, so the editor does not advertise its Run action before DICK/OS has
-scheduler/job-control support. It does not publish the CraftOS shell globally.
-Leaving that editor returns to the protected DICK child-command call, not a
-CraftOS command prompt; editor runtime errors and Ctrl+T remain ordinary child
-outcomes handled by the existing shell boundary.
+scheduler/job-control support. The environment's `require` function and
+`package` table come from CC:T's bundled `cc/require.lua` package factory, using
+the ROM editor directory; internal editor modules are not injected one by one.
+It does not publish the CraftOS shell globally. Leaving that editor returns to
+the protected DICK child-command call, not a CraftOS command prompt; editor
+runtime errors and Ctrl+T remain ordinary child outcomes handled by the
+existing shell boundary.
 
 The parser recognises whitespace plus matching single and double quotes.
 Unterminated input reports `Parse error: unterminated quote` and returns to the

@@ -4,27 +4,95 @@
 local EDIT_WRAPPER_SOURCE = "src/dickos/bin/edit.lua"
 local SHELL_SOURCE = "src/dickos/system/shell.lua"
 local ROM_EDITOR_PATH = "/rom/programs/edit.lua"
+local PACKAGE_LOADER_PATH = "rom/modules/main/cc/require.lua"
+local EDITOR_DIRECTORY = "rom/programs"
+local TEST_MODULE_NAME = "test.editor_dependency"
 local EXPECTED_TARGET = "/dickos/home/bootstrap/test.txt"
 local TEST_STOP = "__DICK_EDIT_TEST_STOP__"
 
+local TEST_MODULE_SOURCE = [[
+local compatibilityShell = shell
+
+return {
+    marker = "loaded through editor require",
+    resolve = function(path)
+        return compatibilityShell.resolve(path)
+    end,
+}
+]]
+
 local hostLoad = load
 local hostLoadfile = loadfile
+local hostGlobalPackage = rawget(_G, "package")
+local hostGlobalRequire = rawget(_G, "require")
 local hostGlobalShell = rawget(_G, "shell")
 
 -- Give a test program ordinary desktop Lua globals while deliberately masking
--- any host-provided `shell`. A metatable `__index` function runs only when a key
--- is absent from the test environment, making this a close host-side analogue
--- of DICK/OS userspace where the CraftOS shell global is unavailable.
-local function inheritHostGlobalsWithoutShell(environment)
+-- host-provided `shell`, `require`, and `package`. A metatable `__index`
+-- function runs only when a key is absent from the test environment, making
+-- this a close host-side analogue of a CraftOS program before its shell injects
+-- program-specific APIs.
+local function inheritHostGlobalsWithoutProgramAPIs(environment)
     setmetatable(environment, {
         __index = function(_, fieldName)
-            if fieldName == "shell" then
+            if fieldName == "shell" or fieldName == "require" or
+                fieldName == "package" then
                 return nil
             end
 
             return _G[fieldName]
         end,
     })
+end
+
+-- Stand in for CC:T's bundled `cc/require.lua` during host tests. The returned
+-- `require` does real module work: it compiles TEST_MODULE_SOURCE in the editor
+-- environment, executes it, and caches the returned module in `package.loaded`.
+-- This ensures the regression cannot pass by merely inserting a dummy function
+-- named `require`.
+local function createMockPackageLoader(onMake, onModuleLoad)
+    return {
+        make = function(environment, directory)
+            if onMake ~= nil then
+                onMake(environment, directory)
+            end
+
+            local packageEnvironment = {
+                loaded = {
+                    _G = environment,
+                },
+            }
+            packageEnvironment.loaded.package = packageEnvironment
+
+            local function requireModule(moduleName)
+                local alreadyLoaded = packageEnvironment.loaded[moduleName]
+
+                if alreadyLoaded ~= nil then
+                    return alreadyLoaded
+                end
+
+                if moduleName ~= TEST_MODULE_NAME then
+                    error("unexpected test module: " .. tostring(moduleName), 0)
+                end
+
+                if onModuleLoad ~= nil then
+                    onModuleLoad(moduleName)
+                end
+
+                local moduleProgram = assert(hostLoad(
+                    TEST_MODULE_SOURCE,
+                    "@/rom/modules/main/test/editor_dependency.lua",
+                    "t",
+                    environment
+                ))
+                local loadedModule = moduleProgram()
+                packageEnvironment.loaded[moduleName] = loadedModule
+                return loadedModule
+            end
+
+            return requireModule, packageEnvironment
+        end,
+    }
 end
 
 -- Execute edit.lua without a global shell, and replace the ROM program with a
@@ -34,19 +102,48 @@ end
 local function testCompatibilityEnvironment()
     local receivedPath = nil
     local receivedEditorEnvironment = nil
+    local packageEnvironmentMade = nil
+    local packageDirectory = nil
+    local moduleLoadCount = 0
     local wrapperEnvironment = {}
 
-    inheritHostGlobalsWithoutShell(wrapperEnvironment)
+    inheritHostGlobalsWithoutProgramAPIs(wrapperEnvironment)
     wrapperEnvironment._G = wrapperEnvironment
+
+    wrapperEnvironment.fs = {
+        getDir = function(path)
+            assert(path == ROM_EDITOR_PATH)
+            return EDITOR_DIRECTORY
+        end,
+    }
+
+    wrapperEnvironment.dofile = function(path)
+        assert(path == PACKAGE_LOADER_PATH)
+
+        return createMockPackageLoader(
+            function(environment, directory)
+                packageEnvironmentMade = environment
+                packageDirectory = directory
+            end,
+            function(moduleName)
+                assert(moduleName == TEST_MODULE_NAME)
+                moduleLoadCount = moduleLoadCount + 1
+            end
+        )
+    end
 
     wrapperEnvironment.__recordEditorPath = function(
         resolvedPath,
-        compatibilityShell
+        compatibilityShell,
+        packageEnvironment,
+        moduleMarker
     )
         assert(type(compatibilityShell) == "table")
         assert(type(compatibilityShell.resolve) == "function")
         assert(compatibilityShell.openTab == nil)
         assert(compatibilityShell.switchTab == nil)
+        assert(type(packageEnvironment) == "table")
+        assert(moduleMarker == "loaded through editor require")
 
         receivedPath = resolvedPath
         assert(receivedPath == EXPECTED_TARGET)
@@ -64,13 +161,25 @@ local function testCompatibilityEnvironment()
         -- this reproducer would fail with the original "global 'shell'" error.
         return assert(hostLoad([[
             local pathArgument = ...
-            local resolvedPath = shell.resolve(pathArgument)
-            __recordEditorPath(resolvedPath, shell)
+            local dependency = require "test.editor_dependency"
+            local cachedDependency = require "test.editor_dependency"
+            assert(cachedDependency == dependency)
+            assert(package.loaded["test.editor_dependency"] == dependency)
+
+            local resolvedPath = dependency.resolve(pathArgument)
+            __recordEditorPath(
+                resolvedPath,
+                shell,
+                package,
+                dependency.marker
+            )
         ]], "@/rom/programs/edit.lua", "t", environment))
     end
 
     assert(rawget(wrapperEnvironment, "shell") == nil)
     assert(wrapperEnvironment.shell == nil)
+    assert(wrapperEnvironment.require == nil)
+    assert(wrapperEnvironment.package == nil)
 
     local wrapperProgram = assert(hostLoadfile(
         EDIT_WRAPPER_SOURCE,
@@ -85,7 +194,12 @@ local function testCompatibilityEnvironment()
 
     assert(succeeded, tostring(failure))
     assert(receivedPath == EXPECTED_TARGET)
+    assert(packageEnvironmentMade == receivedEditorEnvironment)
+    assert(packageDirectory == EDITOR_DIRECTORY)
+    assert(moduleLoadCount == 1)
     assert(rawget(wrapperEnvironment, "shell") == nil)
+    assert(rawget(_G, "require") == hostGlobalRequire)
+    assert(rawget(_G, "package") == hostGlobalPackage)
     assert(rawget(_G, "shell") == hostGlobalShell)
 
     -- `_G` inside the child must describe the compatibility environment, not
@@ -99,10 +213,15 @@ local function testCompatibilityEnvironment()
 
     for fieldName in pairs(receivedEditorEnvironment) do
         environmentFieldCount = environmentFieldCount + 1
-        assert(fieldName == "_G" or fieldName == "shell")
+        assert(fieldName == "_G" or fieldName == "shell" or
+            fieldName == "require" or fieldName == "package")
     end
 
-    assert(environmentFieldCount == 2)
+    assert(environmentFieldCount == 4)
+    assert(type(receivedEditorEnvironment.require) == "function")
+    assert(type(receivedEditorEnvironment.package) == "table")
+    assert(receivedEditorEnvironment.package.loaded[TEST_MODULE_NAME].marker ==
+        "loaded through editor require")
 
     local shellFieldCount = 0
 
@@ -135,7 +254,10 @@ local function runShellScenario(editorFailure)
         currentLine = "",
         editorEnvironment = nil,
         editorPath = nil,
+        moduleLoads = 0,
         output = {},
+        packageEnvironmentMade = nil,
+        packageDirectory = nil,
         prompts = {},
         readCalls = 0,
         textColor = nil,
@@ -202,14 +324,34 @@ local function runShellScenario(editorFailure)
         error("unexpected directory creation: " .. tostring(path), 0)
     end
 
+    fsMock.getDir = function(path)
+        assert(path == ROM_EDITOR_PATH)
+        return EDITOR_DIRECTORY
+    end
+
     local shellEnvironment = {
         colors = colorsMock,
         fs = fsMock,
         term = termMock,
     }
 
-    inheritHostGlobalsWithoutShell(shellEnvironment)
+    inheritHostGlobalsWithoutProgramAPIs(shellEnvironment)
     shellEnvironment._G = shellEnvironment
+
+    shellEnvironment.dofile = function(path)
+        assert(path == PACKAGE_LOADER_PATH)
+
+        return createMockPackageLoader(
+            function(environment, directory)
+                state.packageEnvironmentMade = environment
+                state.packageDirectory = directory
+            end,
+            function(moduleName)
+                assert(moduleName == TEST_MODULE_NAME)
+                state.moduleLoads = state.moduleLoads + 1
+            end
+        )
+    end
 
     shellEnvironment.__runMockEditor = function(resolvedPath)
         state.editorPath = resolvedPath
@@ -281,7 +423,8 @@ local function runShellScenario(editorFailure)
 
             return assert(hostLoad([[
                 local pathArgument = ...
-                local resolvedPath = shell.resolve(pathArgument)
+                local dependency = require "test.editor_dependency"
+                local resolvedPath = dependency.resolve(pathArgument)
                 __runMockEditor(resolvedPath)
             ]], "@/rom/programs/edit.lua", "t", environment))
         end
@@ -291,6 +434,8 @@ local function runShellScenario(editorFailure)
 
     assert(rawget(shellEnvironment, "shell") == nil)
     assert(shellEnvironment.shell == nil)
+    assert(shellEnvironment.require == nil)
+    assert(shellEnvironment.package == nil)
 
     local shellProgram = assert(hostLoadfile(
         SHELL_SOURCE,
@@ -311,6 +456,9 @@ local function runShellScenario(editorFailure)
     assert(not shellSucceeded)
     assert(string.find(tostring(shellError), TEST_STOP, 1, true) ~= nil)
     assert(state.editorPath == EXPECTED_TARGET)
+    assert(state.packageEnvironmentMade == state.editorEnvironment)
+    assert(state.packageDirectory == EDITOR_DIRECTORY)
+    assert(state.moduleLoads == 1)
     assert(state.readCalls == 3)
     assert(state.prompts[1] == "bootstrap@test-host:~$ ")
     assert(state.prompts[2] == "bootstrap@test-host:~$ ")

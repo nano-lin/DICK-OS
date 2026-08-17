@@ -2,6 +2,7 @@
 -- Version: 0.1.0-unstable
 
 local ROM_EDITOR_PATH = "/rom/programs/edit.lua"
+local PACKAGE_LOADER_PATH = "rom/modules/main/cc/require.lua"
 local context, requestedPath, extraArgument = ...
 
 local function normalizeAbsolutePath(path)
@@ -73,6 +74,32 @@ local function createEditorEnvironment(targetPath)
     -- it back to this compatibility table instead of exposing the parent table
     -- and a possible full CraftOS shell through `_G.shell`.
     editorEnvironment._G = editorEnvironment
+
+    -- CraftOS does not obtain `require` and `package` through `_G`. Its shell
+    -- asks CC:T's bundled package-loader factory to create one package context
+    -- for each program environment. The ROM editor requires internal menu and
+    -- syntax modules, so reproduce that official mechanism instead of exposing
+    -- individual modules or the real CraftOS shell.
+    local packageLoader = dofile(PACKAGE_LOADER_PATH)
+
+    if type(packageLoader) ~= "table" or
+        type(packageLoader.make) ~= "function" then
+        error("edit: CC:T package loader is unavailable.", 0)
+    end
+
+    -- `fs.getDir` derives the ROM program directory from the exact editor path.
+    -- The package factory returns two values: the environment-specific
+    -- `require` function and its matching `package` table.
+    editorEnvironment.require, editorEnvironment.package = packageLoader.make(
+        editorEnvironment,
+        fs.getDir(ROM_EDITOR_PATH)
+    )
+
+    if type(editorEnvironment.require) ~= "function" or
+        type(editorEnvironment.package) ~= "table" then
+        error("edit: CC:T package environment could not be created.", 0)
+    end
+
     return editorEnvironment
 end
 
