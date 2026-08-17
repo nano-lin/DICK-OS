@@ -2,7 +2,7 @@
 -- Version: 0.1.0-unstable
 
 local ROM_EDITOR_PATH = "/rom/programs/edit.lua"
-local PACKAGE_LOADER_PATH = "rom/modules/main/cc/require.lua"
+local PACKAGE_LOADER_PATH = "/rom/modules/main/cc/require.lua"
 local context, requestedPath, extraArgument = ...
 
 local function normalizeAbsolutePath(path)
