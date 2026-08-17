@@ -259,6 +259,41 @@ function editorBuffer.movePage(state, lineDelta)
     moveVertically(state, lineDelta)
 end
 
+-- Move the vertical viewport independently from ordinary cursor navigation.
+-- Mouse-wheel scrolling keeps the cursor unchanged while it remains visible.
+-- If the new viewport would hide it, the cursor moves only as far as the
+-- nearest visible row and its column is clamped to that row's text. Scrolling
+-- changes neither buffer contents nor dirty state.
+function editorBuffer.scrollVertically(state, lineDelta, textHeight)
+    if textHeight < 1 then
+        error("editor viewport must have a positive height", 0)
+    end
+
+    local maximumScrollY = math.max(1, #state.lines - textHeight + 1)
+
+    state.scrollY = clamp(
+        state.scrollY + lineDelta,
+        1,
+        maximumScrollY
+    )
+
+    local lastVisibleLine = math.min(
+        #state.lines,
+        state.scrollY + textHeight - 1
+    )
+
+    if state.cursorLine < state.scrollY then
+        state.cursorLine = state.scrollY
+    elseif state.cursorLine > lastVisibleLine then
+        state.cursorLine = lastVisibleLine
+    end
+
+    state.cursorColumn = math.min(
+        state.cursorColumn,
+        #state.lines[state.cursorLine] + 1
+    )
+end
+
 -- Adjust one-based viewport starts until the insertion cursor is visible.
 -- `textWidth` and `textHeight` describe only the editable area, excluding line
 -- numbers and UI bars. Long lines are clipped rather than wrapped in v1.

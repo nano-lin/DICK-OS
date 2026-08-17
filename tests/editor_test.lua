@@ -45,6 +45,14 @@ local function assertContains(text, fragment)
     )
 end
 
+local function assertNotContains(text, fragment)
+    assert(
+        string.find(tostring(text), fragment, 1, true) == nil,
+        "expected text not to contain: " .. fragment .. "\nactual: " ..
+            tostring(text)
+    )
+end
+
 local function assertLines(state, expectedLines)
     assert(#state.lines == #expectedLines)
 
@@ -200,6 +208,43 @@ assert(horizontalViewportState.cursorColumn <=
 buffer.moveHome(horizontalViewportState)
 buffer.ensureCursorVisible(horizontalViewportState, 12, 4)
 assert(horizontalViewportState.scrollX == 1)
+
+local mouseViewportState = buffer.new(manyLines, "/mouse.txt")
+local mouseTextBefore = buffer.serialize(mouseViewportState)
+
+buffer.scrollVertically(mouseViewportState, 3, 5)
+assert(mouseViewportState.scrollY == 4)
+assert(mouseViewportState.cursorLine == 4)
+assert(not mouseViewportState.dirty)
+assert(buffer.serialize(mouseViewportState) == mouseTextBefore)
+
+buffer.scrollVertically(mouseViewportState, 100, 5)
+assert(mouseViewportState.scrollY == 26)
+assert(mouseViewportState.cursorLine == 26)
+
+-- The cursor remains unchanged because line 26 is still visible after this
+-- upward wheel movement (the new viewport covers lines 23 through 27).
+buffer.scrollVertically(mouseViewportState, -3, 5)
+assert(mouseViewportState.scrollY == 23)
+assert(mouseViewportState.cursorLine == 26)
+
+buffer.scrollVertically(mouseViewportState, -100, 5)
+assert(mouseViewportState.scrollY == 1)
+assert(mouseViewportState.cursorLine == 5)
+assert(not mouseViewportState.dirty)
+assert(buffer.serialize(mouseViewportState) == mouseTextBefore)
+
+-- Page movement still moves the cursor first, after which the existing
+-- cursor-visibility rule advances or restores the keyboard viewport.
+local keyboardViewportState = buffer.new(manyLines, "/keyboard-scroll.txt")
+buffer.movePage(keyboardViewportState, 5)
+buffer.ensureCursorVisible(keyboardViewportState, 20, 5)
+assert(keyboardViewportState.cursorLine == 6)
+assert(keyboardViewportState.scrollY == 2)
+buffer.movePage(keyboardViewportState, -5)
+buffer.ensureCursorVisible(keyboardViewportState, 20, 5)
+assert(keyboardViewportState.cursorLine == 1)
+assert(keyboardViewportState.scrollY == 1)
 
 -- EDITOR PROGRAM HARNESS ---------------------------------------------------
 
@@ -615,6 +660,42 @@ local keyboardState, keyboardSucceeded, keyboardFailure = runEditor({
 assert(keyboardSucceeded, tostring(keyboardFailure))
 assert(keyboardState.files[keyboardPath] == "a\nb    c")
 
+-- Ctrl may still be down when CC:T delivers the authoritative paste event.
+-- Saving afterwards proves that the event reached the real editor event loop,
+-- not merely the pure buffer helper.
+local controlPasteEvents = {
+    { "key", keysMock.leftCtrl, false },
+    { "paste", "pasted-word" },
+    { "key_up", keysMock.leftCtrl },
+}
+appendControlKey(controlPasteEvents, keysMock.s)
+appendControlKey(controlPasteEvents, keysMock.q)
+local controlPastePath = "/control-paste.txt"
+local controlPasteState, controlPasteSucceeded, controlPasteFailure =
+    runEditor({
+        requestedPath = controlPastePath,
+        events = controlPasteEvents,
+    })
+assert(controlPasteSucceeded, tostring(controlPasteFailure))
+assert(controlPasteState.files[controlPastePath] == "pasted-word")
+
+local multilinePasteEvents = {
+    { "key", keysMock.leftCtrl, false },
+    { "paste", "first\nsecond\n" },
+    { "key_up", keysMock.leftCtrl },
+}
+appendControlKey(multilinePasteEvents, keysMock.s)
+appendControlKey(multilinePasteEvents, keysMock.q)
+local multilinePastePath = "/multiline-paste.txt"
+local multilinePasteState, multilinePasteSucceeded, multilinePasteFailure =
+    runEditor({
+        requestedPath = multilinePastePath,
+        events = multilinePasteEvents,
+    })
+assert(multilinePasteSucceeded, tostring(multilinePasteFailure))
+assert(multilinePasteState.files[multilinePastePath] ==
+    "first\nsecond\n")
+
 local directoryPath = "/dickos/home/bootstrap/projects/folder"
 local _, directorySucceeded, directoryFailure = runEditor({
     requestedPath = "folder",
@@ -646,7 +727,9 @@ local limitState, limitSucceeded, limitFailure = runEditor({
     requestedPath = limitPath,
     files = { [limitPath] = string.rep("x", 256 * 1024) },
     events = {
-        { "char", "y" },
+        { "key", keysMock.leftCtrl, false },
+        { "paste", "y" },
+        { "key_up", keysMock.leftCtrl },
         { "key", keysMock.leftCtrl, false },
         { "key", keysMock.q, false },
     },
@@ -701,6 +784,44 @@ assertContains(cleanState.frames[1], "DICK EDIT")
 assertContains(cleanState.frames[1], "1 | ")
 assertContains(cleanState.frames[1], "Ctrl+S Save  Ctrl+Q Quit")
 
+local scrollContents = table.concat(manyLines, "\n")
+local mouseScrollEvents = {
+    { "mouse_scroll", 1, 10, 10 },
+    { "mouse_scroll", 1, 10, 10 },
+    { "mouse_scroll", -1, 10, 10 },
+}
+appendControlKey(mouseScrollEvents, keysMock.q)
+local mouseScrollPath = "/mouse-scroll.txt"
+local mouseScrollState, mouseScrollSucceeded, mouseScrollFailure = runEditor({
+    requestedPath = mouseScrollPath,
+    files = { [mouseScrollPath] = scrollContents },
+    events = mouseScrollEvents,
+})
+assert(mouseScrollSucceeded, tostring(mouseScrollFailure))
+assertContains(mouseScrollState.frames[1], " 1 | line 1")
+assertContains(mouseScrollState.frames[2], " 4 | line 4")
+assertNotContains(mouseScrollState.frames[2], " 1 | line 1")
+assertContains(mouseScrollState.frames[3], " 7 | line 7")
+assertContains(mouseScrollState.frames[4], " 4 | line 4")
+assert(mouseScrollState.files[mouseScrollPath] == scrollContents)
+assert(#mouseScrollState.writePaths == 0)
+
+local keyboardScrollEvents = {
+    { "key", keysMock.pageDown, false },
+    { "key", keysMock.pageUp, false },
+}
+appendControlKey(keyboardScrollEvents, keysMock.q)
+local keyboardScrollState, keyboardScrollSucceeded, keyboardScrollFailure =
+    runEditor({
+        requestedPath = mouseScrollPath,
+        files = { [mouseScrollPath] = scrollContents },
+        events = keyboardScrollEvents,
+    })
+assert(keyboardScrollSucceeded, tostring(keyboardScrollFailure))
+assertContains(keyboardScrollState.frames[2], " 2 | line 2")
+assertContains(keyboardScrollState.frames[2], "16 | line 16")
+assertContains(keyboardScrollState.frames[3], " 1 | line 1")
+
 local expandingGutterEvents = { { "key", keysMock.enter, false } }
 appendControlKey(expandingGutterEvents, keysMock.q)
 appendControlKey(expandingGutterEvents, keysMock.q)
@@ -735,6 +856,29 @@ local cancelState, cancelSucceeded, cancelFailure = runEditor({
 assert(cancelSucceeded, tostring(cancelFailure))
 assertContains(cancelState.framesText, "Unsaved changes.")
 assertContains(cancelState.framesText, "Ctrl+S Save  Ctrl+Q Quit")
+
+-- Pasting is an editing action, so it cancels an older discard confirmation.
+-- If the confirmation remained armed, the first Ctrl+Q after paste would exit
+-- at event 9 instead of arming a fresh warning and reaching event 12.
+local pasteCancelEvents = { { "char", "x" } }
+appendControlKey(pasteCancelEvents, keysMock.q)
+pasteCancelEvents[#pasteCancelEvents + 1] = {
+    "key",
+    keysMock.leftCtrl,
+    false,
+}
+pasteCancelEvents[#pasteCancelEvents + 1] = { "paste", "y" }
+pasteCancelEvents[#pasteCancelEvents + 1] = {
+    "key_up",
+    keysMock.leftCtrl,
+}
+appendControlKey(pasteCancelEvents, keysMock.q)
+appendControlKey(pasteCancelEvents, keysMock.q)
+local pasteCancelState, pasteCancelSucceeded, pasteCancelFailure = runEditor({
+    events = pasteCancelEvents,
+})
+assert(pasteCancelSucceeded, tostring(pasteCancelFailure))
+assert(pasteCancelState.eventIndex == 12)
 
 -- A repeated Q key must not satisfy discard confirmation by itself. The next
 -- Escape proves the editor remained alive after the repeat event.

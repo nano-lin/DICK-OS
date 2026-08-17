@@ -11,6 +11,7 @@ local MAXIMUM_FILE_BYTES = 256 * 1024
 local MINIMUM_SCREEN_WIDTH = 42
 local MINIMUM_SCREEN_HEIGHT = 7
 local TAB_SPACES = "    "
+local MOUSE_SCROLL_LINES = 3
 
 local EDITOR_BACKGROUND = colors.black
 local PRIMARY_TEXT = colors.white
@@ -179,6 +180,7 @@ local function loadBufferLibrary()
         "moveHome",
         "moveEnd",
         "movePage",
+        "scrollVertically",
         "ensureCursorVisible",
     }
 
@@ -720,11 +722,24 @@ while not shouldQuit do
         controlKeyDown = false
     elseif event == "char" and not controlKeyDown then
         insertTextWithinLimit(first)
-    elseif event == "paste" and not controlKeyDown then
-        -- Plain paste is cheap because the buffer already supports multi-line
-        -- insertion. There is still no selection, clipboard ownership, or cut
-        -- operation in v1.
+    elseif event == "paste" then
+        -- A paste event is the authoritative text-insertion signal. CC:T emits
+        -- it as a consequence of Ctrl+V, so the control key may legitimately
+        -- still be down when this event arrives. The normal insertion helper
+        -- preserves multi-line splitting, size limits, dirty state, and
+        -- cancellation of an armed discard confirmation.
         insertTextWithinLimit(first)
+    elseif event == "mouse_scroll" then
+        -- Official CC:T direction values are -1 for up and 1 for down. Move a
+        -- small fixed number of document rows and let the pure buffer helper
+        -- clamp both viewport and, only when necessary, the visible cursor.
+        discardConfirmationArmed = false
+        clearTransientStatus()
+        buffer.scrollVertically(
+            document,
+            first * MOUSE_SCROLL_LINES,
+            layout.textHeight
+        )
     elseif event == "term_resize" then
         -- The common redraw below recomputes all dimensions. Keeping resize as
         -- an explicit recognised event documents that no old layout is reused.

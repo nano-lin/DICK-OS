@@ -1048,6 +1048,12 @@ also retains direct CraftOS-rescue invocation with ordinary arguments.
 bootstrap mode and directs the user to `reboot` or `shutdown`; explicit CraftOS
 access remains a Recovery selection only.
 
+The bootstrap DICK shell does not implement mouse-wheel output scrollback. It
+does not yet retain a historical output model, and calling `term.scroll()`
+would only move and discard visible terminal cells rather than navigate real
+history. Mouse-wheel shell scrollback remains a future shell feature and is
+separate from native editor viewport scrolling.
+
 ---
 
 # 24. Base commands
@@ -1247,7 +1253,15 @@ Editor v1 keys are:
 - Ctrl+Q: quit immediately when clean; when dirty, show a warning first and
   require a second non-repeated Ctrl+Q to discard;
 - Escape: cancel the pending discard confirmation;
-- plain CC:T paste events: insert text, including newline splitting.
+- plain CC:T paste events: insert text, including newline splitting, even when
+  Ctrl remains down from Ctrl+V;
+- mouse wheel: scroll the text viewport three lines up/down.
+
+Mouse-wheel scrolling clamps at the document boundaries and does not change
+text or dirty state. The cursor stays on its original line while that line is
+visible. If scrolling would hide it, the cursor moves to the nearest visible
+line and its column is clamped to that line's length. Mouse clicks, dragging,
+selection, and mouse editing remain outside v1.
 
 A failed Save leaves the editor open and dirty with a visible diagnostic.
 Editor v1 uses a direct CC:T write after a writable handle is obtained; it does
