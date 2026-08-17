@@ -1253,9 +1253,18 @@ Editor v1 keys are:
 - Ctrl+Q: quit immediately when clean; when dirty, show a warning first and
   require a second non-repeated Ctrl+Q to discard;
 - Escape: cancel the pending discard confirmation;
-- plain CC:T paste events: insert text, including newline splitting, even when
-  Ctrl remains down from Ctrl+V;
+- CC:T paste events: insert the delivered text even when Ctrl remains down
+  from Ctrl+V;
 - mouse wheel: scroll the text viewport three lines up/down.
+
+The `paste` event itself is authoritative. The editor's buffer can process
+newline characters when they are present in the event text, including line
+splitting and LF normalisation. Host-side tests inject such synthetic event
+text to verify that internal behaviour. The standard CC:T Minecraft client
+clipboard path, however, delivers only the first clipboard line to a Lua
+program. Normal Ctrl+V is therefore effectively single-line, and multiline
+clipboard paste is unavailable through that client path. This is a CC:T input
+limitation rather than an editor-buffer failure.
 
 Mouse-wheel scrolling clamps at the document boundaries and does not change
 text or dirty state. The cursor stays on its original line while that line is
@@ -1276,10 +1285,44 @@ the same session/prompt, and does not enter Recovery or CraftOS. The editor
 does not log keystrokes, pasted text, or buffer contents; current diagnostics
 remain the shell's best-effort child failure/termination records.
 
-Deferred DICK EDIT v2 work includes native syntax highlighting, search and
-replace, goto line, undo/redo, selection, copy/cut clipboard operations, mouse
-positioning, bracket matching, auto-indent, configurable tab width, read-only
-mode, multiple buffers, and tabs. Editor v1 has no scheduler-backed Run action.
+### Runtime verification
+
+DICK EDIT v1 has been manually runtime-verified in Minecraft with CC:T. The
+confirmed paths include:
+
+- native editor startup and return to the DICK shell without a CraftOS prompt;
+- opening, creating, saving, and reopening files through relative, absolute,
+  and DICK-home (`~`) paths;
+- character input, cursor movement, Home/End, PageUp/PageDown, Enter,
+  Backspace, Delete, Tab, and line splitting/joining;
+- line numbers, vertical and horizontal viewport movement, and mouse-wheel
+  scrolling through a document longer than the screen;
+- dirty-state indication, unsaved-quit confirmation, and Escape cancellation;
+- Ctrl+T child termination, terminal restoration, and a healthy subsequent
+  shell prompt;
+- single-line clipboard paste through normal Minecraft Ctrl+V.
+
+Multiline Ctrl+V through the standard Minecraft client is N/A/unsupported
+because that path does not deliver a multiline `paste` event to the program.
+The runtime result does not contradict the synthetic host test of the editor's
+newline-containing event handling.
+
+### Current limitations
+
+DICK EDIT v1 currently has:
+
+- effectively single-line normal Ctrl+V due to the standard CC:T client path;
+- no selection or cut/copy operations (clipboard paste is supported);
+- no undo/redo;
+- no search/replace;
+- no syntax highlighting;
+- no multiple buffers or tabs;
+- direct, non-atomic save replacement.
+
+Other deferred work includes goto line, mouse positioning, bracket matching,
+auto-indent, configurable tab width, and read-only mode. Editor v1 has no
+scheduler-backed Run action. These are possible later milestones, not
+implemented v1 behaviour.
 
 ## Visual language
 

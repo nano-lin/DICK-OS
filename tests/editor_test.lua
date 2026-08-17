@@ -679,6 +679,9 @@ local controlPasteState, controlPasteSucceeded, controlPasteFailure =
 assert(controlPasteSucceeded, tostring(controlPasteFailure))
 assert(controlPasteState.files[controlPastePath] == "pasted-word")
 
+-- This deliberately injects a newline-containing paste event. It verifies the
+-- editor's internal event/buffer handling, not normal Minecraft Ctrl+V: the
+-- standard CC:T client clipboard path only delivers the first clipboard line.
 local multilinePasteEvents = {
     { "key", keysMock.leftCtrl, false },
     { "paste", "first\nsecond\n" },
