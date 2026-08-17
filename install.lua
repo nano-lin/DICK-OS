@@ -10,12 +10,32 @@ local INSTALL_PATH = "/dickos"
 local STARTUP_PATH = "/startup.lua"
 local ALTERNATE_STARTUP_PATH = "/startup"
 
+-- The development channel is intentionally expressed as separate repository
+-- coordinates. Replacing `main` with a tag or immutable commit later changes
+-- the selected source without redesigning URL construction or deployment.
+-- `main` is mutable and is not a cryptographic integrity guarantee.
+local REPOSITORY_OWNER = "nano-lin"
+local REPOSITORY_NAME = "DICK-OS"
+local REPOSITORY_REF = "main"
+local RAW_CONTENT_ORIGIN = "https://raw.githubusercontent.com"
+local MANIFEST_SOURCE_PATH = "manifest.lua"
+local EXPECTED_MANIFEST_VERSION = 1
+local MAXIMUM_MANIFEST_FILES = 256
+
 local LOCAL_STARTUP_SETTING = "shell.allow_startup"
 local DISK_STARTUP_SETTING = "shell.allow_disk_startup"
 
 local MIB = 1024 * 1024
 local MINIMUM_CAPACITY = 4 * MIB
 local RECOMMENDED_CAPACITY = 16 * MIB
+
+local function formatByteCount(byteCount)
+    if byteCount < 1024 then
+        return string.format("%d B", byteCount)
+    end
+
+    return string.format("%.1f KiB", byteCount / 1024)
+end
 
 -- These flags let the final error handler distinguish a preflight failure
 -- from an unexpected error during deployment. Ownership is tracked separately
@@ -76,7 +96,8 @@ local function prepareTerminal()
 end
 
 local function printHeader()
-    print("DICK/OS " .. VERSION)
+    print("DICK/OS NETWORK INSTALLER")
+    print(VERSION)
     print("Distributed Infrastructure & Computer Kit")
     print()
     print("Installer preflight")
@@ -160,14 +181,10 @@ local function getStorageInformation()
     return capacityOrError, freeSpaceOrError, nil
 end
 
--- Check the storage policy without changing the filesystem. The 4 MiB minimum
--- applies to the total main-filesystem capacity. Free space is reported too,
--- so a later write failure can be diagnosed rather than hidden.
---
--- TODO: Once DICK/OS has a real installation payload, calculate the required
--- free space from that payload and enforce the calculated value here. Until
--- then, an arbitrary minimum-free-space threshold would not describe an actual
--- installation requirement, so only total capacity has a minimum.
+-- Check the local storage policy before spending time on network requests.
+-- The 4 MiB minimum applies to total main-filesystem capacity. Exact payload
+-- free-space validation occurs after every remote body is available in memory,
+-- because only then does the installer know the current content size.
 local function validateStorage()
     local capacity, freeSpace, storageError = getStorageInformation()
 
@@ -196,6 +213,34 @@ local function validateStorage()
         warn("16 MiB total storage capacity is recommended")
     end
 
+    return true
+end
+
+-- Compare current free space with the downloaded content which deployment will
+-- write. This is a content-byte minimum, not an invented permanent threshold;
+-- CC:T filesystem metadata and the existing settings file may still add small
+-- implementation overhead, and any real write failure remains rollback-safe.
+local function validatePayloadFreeSpace(payloadBytes)
+    local _, freeSpace, storageError = getStorageInformation()
+
+    if freeSpace == nil then
+        fail("Unable to recheck free space for the downloaded payload.")
+        print("       Details: " .. tostring(storageError))
+        return false
+    end
+
+    info(string.format(
+        "Payload requires %s; %s free",
+        formatByteCount(payloadBytes),
+        formatByteCount(freeSpace)
+    ))
+
+    if freeSpace < payloadBytes then
+        fail("Not enough free space for the downloaded DICK/OS payload.")
+        return false
+    end
+
+    ok("Downloaded payload fits in current free space")
     return true
 end
 
@@ -354,138 +399,442 @@ local function confirmInstallation()
     return answer == "y" or answer == "yes"
 end
 
--- Read one repository source file into memory during preflight.
---
--- This milestone deliberately uses a small local payload instead of inventing
--- a downloader or package manager. `shell.getRunningProgram` identifies the
--- installer file being executed, and the payload is expected in its sibling
--- `src` directory. Reading the source before confirmation is safe because
--- `fs.open` with mode "r" does not change the filesystem.
-local function readSourceFile(path)
-    local file, openError = fs.open(path, "r")
+-- Build one raw-content URL from the selected repository coordinates. Manifest
+-- validation below restricts every source to a safe relative `src/...` path,
+-- so no downloaded value can inject another host, query, or parent directory.
+local function buildRawContentURL(sourcePath)
+    return table.concat({
+        RAW_CONTENT_ORIGIN,
+        REPOSITORY_OWNER,
+        REPOSITORY_NAME,
+        REPOSITORY_REF,
+        sourcePath,
+    }, "/")
+end
 
-    if file == nil then
-        return nil, "Unable to open source file " .. path .. ": " ..
-            tostring(openError)
+-- HTTP responses are handles backed by network resources and should be closed
+-- even on an error path. `pcall` makes cleanup best-effort: a broken handle
+-- must not replace the more useful request/read error which caused the abort.
+local function closeHTTPResponseBestEffort(response)
+    pcall(function()
+        if response ~= nil and type(response.close) == "function" then
+            response.close()
+        end
+    end)
+end
+
+-- Extract an HTTP status from a failed response when CC:T supplies one. A 404
+-- commonly returns `nil, reason, response`; closing that third value prevents
+-- a failed request handle from being left open during the remaining preflight.
+local function describeHTTPFailure(reason, failureResponse)
+    local statusText = nil
+
+    if failureResponse ~= nil then
+        local statusSucceeded, statusCode, statusMessage = pcall(function()
+            if type(failureResponse.getResponseCode) ~= "function" then
+                return nil, nil
+            end
+
+            return failureResponse.getResponseCode()
+        end)
+
+        if statusSucceeded and type(statusCode) == "number" then
+            statusText = tostring(statusCode)
+
+            if type(statusMessage) == "string" and statusMessage ~= "" then
+                statusText = statusText .. " " .. statusMessage
+            end
+        end
+
+        closeHTTPResponseBestEffort(failureResponse)
     end
 
-    local readSucceeded, contentsOrError = pcall(file.readAll)
-    local closeSucceeded, closeError = pcall(file.close)
+    if statusText ~= nil then
+        return statusText
+    end
+
+    if reason == nil or tostring(reason) == "" then
+        return "Unknown HTTP failure"
+    end
+
+    return tostring(reason)
+end
+
+-- Confirm that the HTTP module exists and, where supported, ask CC:T whether
+-- the raw GitHub URL is permitted by server configuration. `checkURL` does not
+-- contact GitHub; the subsequent manifest request remains the real DNS,
+-- connection, timeout, and response check.
+local function verifyHTTPTransport(manifestURL)
+    if type(http) ~= "table" or type(http.get) ~= "function" then
+        return false, "CC:T HTTP API is unavailable or disabled."
+    end
+
+    if type(http.checkURL) ~= "function" then
+        return true, nil
+    end
+
+    -- `pcall` places its own success boolean before every value returned by the
+    -- protected function. The following names therefore preserve both normal
+    -- `checkURL` results without allowing an API exception to escape.
+    local checkSucceeded, allowedOrError, blockedReason = pcall(
+        http.checkURL,
+        manifestURL
+    )
+
+    if not checkSucceeded then
+        return false, "Unable to check the raw GitHub URL: " ..
+            tostring(allowedOrError)
+    end
+
+    if allowedOrError ~= true then
+        return false, tostring(blockedReason or "Domain not permitted")
+    end
+
+    return true, nil
+end
+
+-- Download and completely read one HTTP response. CC:T's synchronous
+-- `http.get` returns either a response handle or nil plus a reason and
+-- sometimes a failing response handle. Every ordinary failure is converted
+-- into a short return value rather than leaking a Lua stack trace.
+local function fetchRemoteText(sourcePath)
+    local url = buildRawContentURL(sourcePath)
+    -- On success, `pcall` preserves all of `http.get`'s return values after its
+    -- leading boolean. This matters because a failed CC:T request may include
+    -- both an error string and a response handle containing an HTTP status.
+    local requestSucceeded, response, requestError, failureResponse = pcall(
+        http.get,
+        url
+    )
+
+    if not requestSucceeded then
+        return nil, tostring(response)
+    end
+
+    if response == nil then
+        return nil, describeHTTPFailure(requestError, failureResponse)
+    end
+
+    local interfaceSucceeded, readAll, close, getResponseCode = pcall(
+        function()
+            return response.readAll, response.close, response.getResponseCode
+        end
+    )
+
+    if not interfaceSucceeded or type(readAll) ~= "function" or
+        type(close) ~= "function" or type(getResponseCode) ~= "function" then
+        closeHTTPResponseBestEffort(response)
+        return nil, "Invalid HTTP response handle"
+    end
+
+    local statusSucceeded, statusCode, statusMessage = pcall(getResponseCode)
+
+    if not statusSucceeded or type(statusCode) ~= "number" then
+        closeHTTPResponseBestEffort(response)
+        return nil, "HTTP response did not provide a valid status code"
+    end
+
+    if statusCode < 200 or statusCode >= 300 then
+        closeHTTPResponseBestEffort(response)
+        return nil, tostring(statusCode) .. " " ..
+            tostring(statusMessage or "HTTP error")
+    end
+
+    local readSucceeded, contentsOrError = pcall(readAll)
+    local closeSucceeded, closeError = pcall(close)
 
     if not readSucceeded then
-        return nil, "Unable to read source file " .. path .. ": " ..
-            tostring(contentsOrError)
+        return nil, "Response read failed: " .. tostring(contentsOrError)
     end
 
     if not closeSucceeded then
-        return nil, "Unable to close source file " .. path .. ": " ..
-            tostring(closeError)
+        return nil, "Response close failed: " .. tostring(closeError)
     end
 
-    if contentsOrError == nil or contentsOrError == "" then
-        return nil, "Source file is empty: " .. path
+    if type(contentsOrError) ~= "string" then
+        return nil, "HTTP response body was not text"
     end
 
     return contentsOrError, nil
 end
 
--- Load the fixed shell-foundation source files into a small payload table.
---
--- Each entry maps a repository source path to its final installed path. The
--- ordering is intentional: normal modules and utilities are deployed before
--- startup.lua, so the boot entry point is the last program file exposed on
--- disk. No generic package/dependency framework is needed for this fixed local
--- bootstrap payload.
-local function loadInstallationPayload()
-    local runningProgram = shell.getRunningProgram()
-    local installerDirectory = fs.getDir(runningProgram)
-    local sourceRoot = fs.combine(installerDirectory, "src")
-    local payload = {
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/system/init.lua"),
-            destinationPath = "/dickos/system/init.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/system/recovery.lua"),
-            destinationPath = "/dickos/system/recovery.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/system/shell.lua"),
-            destinationPath = "/dickos/system/shell.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/lib/log.lua"),
-            destinationPath = "/dickos/lib/log.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/dickfetch.lua"),
-            destinationPath = "/dickos/bin/dickfetch.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/dicklog.lua"),
-            destinationPath = "/dickos/bin/dicklog.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/ls.lua"),
-            destinationPath = "/dickos/bin/ls.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/cat.lua"),
-            destinationPath = "/dickos/bin/cat.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/echo.lua"),
-            destinationPath = "/dickos/bin/echo.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/edit.lua"),
-            destinationPath = "/dickos/bin/edit.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/hostname.lua"),
-            destinationPath = "/dickos/bin/hostname.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/uname.lua"),
-            destinationPath = "/dickos/bin/uname.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/uptime.lua"),
-            destinationPath = "/dickos/bin/uptime.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/df.lua"),
-            destinationPath = "/dickos/bin/df.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/status.lua"),
-            destinationPath = "/dickos/bin/status.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/reboot.lua"),
-            destinationPath = "/dickos/bin/reboot.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "dickos/bin/shutdown.lua"),
-            destinationPath = "/dickos/bin/shutdown.lua",
-        },
-        {
-            sourcePath = fs.combine(sourceRoot, "startup.lua"),
-            destinationPath = STARTUP_PATH,
-        },
-    }
-
-    for _, payloadFile in ipairs(payload) do
-        local contents, readError = readSourceFile(payloadFile.sourcePath)
-
-        if contents == nil then
-            return nil, readError
-        end
-
-        payloadFile.contents = contents
+-- Check individual slash-separated path components. `string.gmatch` returns an
+-- iterator function which yields one component on each loop iteration; exact
+-- `.` and `..` components are unsafe because filesystems interpret them as the
+-- current or parent directory.
+local function hasSafePathSegments(path)
+    if string.find(path, "//", 1, true) ~= nil or
+        string.sub(path, -1) == "/" then
+        return false
     end
 
-    return payload, nil
+    for segment in string.gmatch(path, "[^/]+") do
+        if segment == "." or segment == ".." or segment == "" then
+            return false
+        end
+    end
+
+    return true
+end
+
+-- Repository sources are deliberately restricted to ordinary files below
+-- `src/`. The manifest itself is fetched through a local constant and never
+-- passes this remote-data validation boundary.
+local function isAllowedSourcePath(sourcePath)
+    return type(sourcePath) == "string" and #sourcePath <= 240 and
+        string.match(sourcePath, "^src/[A-Za-z0-9_%.%/%-]+$") ~= nil and
+        hasSafePathSegments(sourcePath)
+end
+
+-- Remote targets may write only inside DICK/OS's owned tree, with one explicit
+-- exception for Stage-0. Paths containing parent/current segments, doubled
+-- separators, or a directory-like trailing slash are rejected before any
+-- payload request or filesystem mutation occurs.
+local function isAllowedTargetPath(targetPath)
+    if targetPath == STARTUP_PATH then
+        return true
+    end
+
+    return type(targetPath) == "string" and #targetPath <= 240 and
+        string.match(
+            targetPath,
+            "^/dickos/[A-Za-z0-9_%.%/%-]+$"
+        ) ~= nil and hasSafePathSegments(targetPath)
+end
+
+-- Ensure a Lua list is dense: only positive consecutive integer keys are
+-- accepted. This prevents a malformed manifest hole from making `ipairs` stop
+-- early and silently omit later payload files.
+local function countDenseListEntries(list)
+    if type(list) ~= "table" then
+        return nil, "Manifest files field must be a table."
+    end
+
+    local entryCount = 0
+    local maximumIndex = 0
+
+    for key in pairs(list) do
+        if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+            return nil, "Manifest files must use positive integer indexes."
+        end
+
+        entryCount = entryCount + 1
+        maximumIndex = math.max(maximumIndex, key)
+    end
+
+    if entryCount == 0 then
+        return nil, "Manifest contains no payload files."
+    end
+
+    if entryCount ~= maximumIndex then
+        return nil, "Manifest files list contains an index gap."
+    end
+
+    if entryCount > MAXIMUM_MANIFEST_FILES then
+        return nil, "Manifest contains too many payload files."
+    end
+
+    return entryCount, nil
+end
+
+-- Copy only validated manifest data into a new table. Remote Lua tables are
+-- not used directly after this point, keeping deployment independent from
+-- unexpected fields or later mutation of the parsed structure.
+local function validateManifest(manifest)
+    if type(manifest) ~= "table" then
+        return nil, "Manifest did not return a table."
+    end
+
+    if manifest.manifestVersion ~= EXPECTED_MANIFEST_VERSION then
+        return nil, string.format(
+            "Unsupported manifest format. Expected: %d Received: %s",
+            EXPECTED_MANIFEST_VERSION,
+            tostring(manifest.manifestVersion)
+        )
+    end
+
+    if manifest.version ~= VERSION then
+        return nil, "Manifest version does not match this installer. " ..
+            "Expected: " .. VERSION .. " Received: " ..
+            tostring(manifest.version)
+    end
+
+    if type(manifest.payloadID) ~= "string" or
+        not string.match(manifest.payloadID, "^[A-Za-z0-9_.%-]+$") or
+        #manifest.payloadID > 96 then
+        return nil, "Manifest payloadID is missing or malformed."
+    end
+
+    local fileCount, listError = countDenseListEntries(manifest.files)
+
+    if fileCount == nil then
+        return nil, listError
+    end
+
+    local validatedFiles = {}
+    local seenSources = {}
+    local seenTargets = {}
+
+    for fileIndex = 1, fileCount do
+        local remoteEntry = manifest.files[fileIndex]
+
+        if type(remoteEntry) ~= "table" then
+            return nil, "Manifest file entry " .. fileIndex ..
+                " must be a table."
+        end
+
+        if not isAllowedSourcePath(remoteEntry.source) then
+            return nil, "Manifest file entry " .. fileIndex ..
+                " has an invalid source path."
+        end
+
+        if not isAllowedTargetPath(remoteEntry.target) then
+            return nil, "Manifest file entry " .. fileIndex ..
+                " has an invalid target path."
+        end
+
+        if remoteEntry.allowEmpty ~= nil and
+            type(remoteEntry.allowEmpty) ~= "boolean" then
+            return nil, "Manifest file entry " .. fileIndex ..
+                " has a non-boolean allowEmpty value."
+        end
+
+        if seenSources[remoteEntry.source] then
+            return nil, "Manifest repeats source: " .. remoteEntry.source
+        end
+
+        if seenTargets[remoteEntry.target] then
+            return nil, "Manifest repeats target: " .. remoteEntry.target
+        end
+
+        seenSources[remoteEntry.source] = true
+        seenTargets[remoteEntry.target] = true
+        validatedFiles[fileIndex] = {
+            source = remoteEntry.source,
+            target = remoteEntry.target,
+            allowEmpty = remoteEntry.allowEmpty == true,
+        }
+    end
+
+    local stage0Entry = validatedFiles[fileCount]
+
+    if stage0Entry.source ~= "src/startup.lua" or
+        stage0Entry.target ~= STARTUP_PATH then
+        return nil, "Stage-0 must be the final manifest payload entry."
+    end
+
+    for fileIndex = 1, fileCount - 1 do
+        if validatedFiles[fileIndex].target == STARTUP_PATH then
+            return nil, "Stage-0 appears before the final manifest entry."
+        end
+    end
+
+    return {
+        manifestVersion = manifest.manifestVersion,
+        version = manifest.version,
+        payloadID = manifest.payloadID,
+        files = validatedFiles,
+    }, nil
+end
+
+-- Compile the data-only Lua manifest with an empty global environment. This
+-- permits the small `return { ... }` format while denying access to filesystem,
+-- HTTP, shell, settings, and other installer globals. Structural/path checks
+-- still run afterwards; this is validation, not a signature or trust proof.
+local function parseManifest(contents)
+    if contents == "" then
+        return nil, "Remote manifest is empty."
+    end
+
+    if type(load) ~= "function" then
+        return nil, "Lua manifest loader is unavailable."
+    end
+
+    local loadSucceeded, manifestProgram, compileError = pcall(
+        load,
+        contents,
+        "@" .. MANIFEST_SOURCE_PATH,
+        "t",
+        {}
+    )
+
+    if not loadSucceeded then
+        return nil, "Manifest compilation failed: " ..
+            tostring(manifestProgram)
+    end
+
+    if type(manifestProgram) ~= "function" then
+        return nil, "Manifest compilation failed: " .. tostring(compileError)
+    end
+
+    local runSucceeded, manifestOrError = pcall(manifestProgram)
+
+    if not runSucceeded then
+        return nil, "Manifest execution failed: " .. tostring(manifestOrError)
+    end
+
+    return validateManifest(manifestOrError)
+end
+
+-- Fetch the manifest through the same checked response path as payload files,
+-- then return only the copied structure accepted by manifest validation.
+local function fetchRemoteManifest()
+    local manifestContents, fetchError = fetchRemoteText(
+        MANIFEST_SOURCE_PATH
+    )
+
+    if manifestContents == nil then
+        return nil, fetchError
+    end
+
+    return parseManifest(manifestContents)
+end
+
+-- Fetch every payload body before returning anything deployable. The returned
+-- list is entirely in memory and preserves manifest order. If one request,
+-- read, empty-content check, or Lua syntax check fails, the partial local table
+-- is discarded and deployment never begins.
+local function downloadInstallationPayload(manifest)
+    local payload = {}
+    local payloadBytes = 0
+
+    for fileIndex, manifestFile in ipairs(manifest.files) do
+        info("Downloading " .. manifestFile.source)
+
+        local contents, fetchError = fetchRemoteText(manifestFile.source)
+
+        if contents == nil then
+            return nil, nil, manifestFile.source, fetchError
+        end
+
+        if contents == "" and not manifestFile.allowEmpty then
+            return nil, nil, manifestFile.source,
+                "Downloaded file is unexpectedly empty"
+        end
+
+        if string.sub(manifestFile.source, -4) == ".lua" then
+            local program, syntaxError = load(
+                contents,
+                "@" .. manifestFile.source,
+                "t",
+                {}
+            )
+
+            if program == nil then
+                return nil, nil, manifestFile.source,
+                    "Lua syntax validation failed: " .. tostring(syntaxError)
+            end
+        end
+
+        payload[fileIndex] = {
+            source = manifestFile.source,
+            target = manifestFile.target,
+            contents = contents,
+        }
+        payloadBytes = payloadBytes + #contents
+    end
+
+    return payload, payloadBytes, nil, nil
 end
 
 -- Capture whether each boot setting has an explicit value, not merely its
@@ -632,7 +981,9 @@ local function writeInitialMetadata(hostname, machineID)
     return true, nil
 end
 
--- Deploy the already-read source payload to its final paths.
+-- Deploy the already-downloaded source payload to its final paths. No HTTP
+-- call occurs here: this critical phase consumes only the validated in-memory
+-- list returned after the complete fetch phase.
 --
 -- The startup ownership flag is set before attempting its write. Preflight and
 -- the immediate pre-deployment recheck proved that `/startup.lua` was absent,
@@ -640,7 +991,7 @@ end
 -- be removed safely during rollback.
 local function writeSystemPayload(payload)
     for _, payloadFile in ipairs(payload) do
-        if payloadFile.destinationPath == STARTUP_PATH then
+        if payloadFile.target == STARTUP_PATH then
             if fs.exists(STARTUP_PATH) then
                 return false,
                     "Refusing to overwrite a newly appeared " .. STARTUP_PATH
@@ -650,7 +1001,7 @@ local function writeSystemPayload(payload)
         end
 
         local writeSucceeded, writeError = writeTextFile(
-            payloadFile.destinationPath,
+            payloadFile.target,
             payloadFile.contents
         )
 
@@ -658,9 +1009,9 @@ local function writeSystemPayload(payload)
             return false, writeError
         end
 
-        if not fs.exists(payloadFile.destinationPath) then
+        if not fs.exists(payloadFile.target) then
             return false,
-                "Installed file is missing: " .. payloadFile.destinationPath
+                "Installed file is missing: " .. payloadFile.target
         end
     end
 
@@ -898,17 +1249,9 @@ local function runInstaller()
         return
     end
 
-    local installationPayload, payloadError = loadInstallationPayload()
-
-    if installationPayload == nil then
-        fail("Unable to load the shell-foundation installation payload.")
-        print("       Details: " .. tostring(payloadError))
-        print("No files were changed.")
-        return
-    end
-
-    ok("Stage-0, shell, logging, and command payload available")
-
+    -- Startup-setting inspection is a local read-only preflight. Performing it
+    -- before HTTP avoids downloading the payload when the later transaction
+    -- could not capture a rollback snapshot safely.
     local capturedSettings, settingsCaptureError = captureBootSettings()
 
     if capturedSettings == nil then
@@ -919,6 +1262,62 @@ local function runInstaller()
     end
 
     bootSettingsSnapshot = capturedSettings
+
+    print()
+    print("Network source")
+    print("--------------")
+    print("Repository: " .. REPOSITORY_OWNER .. "/" .. REPOSITORY_NAME)
+    print("Channel:    " .. REPOSITORY_REF)
+    warn("main is a mutable development channel")
+    print()
+
+    local manifestURL = buildRawContentURL(MANIFEST_SOURCE_PATH)
+    local httpAvailable, httpError = verifyHTTPTransport(manifestURL)
+
+    if not httpAvailable then
+        fail("HTTP transport is unavailable.")
+        print("       Reason: " .. tostring(httpError))
+        print("Enable CC:T HTTP and permit raw.githubusercontent.com.")
+        print("Installation aborted.")
+        print("No files were changed.")
+        return
+    end
+
+    ok("HTTP available")
+    info("Downloading " .. MANIFEST_SOURCE_PATH)
+
+    local installationManifest, manifestError = fetchRemoteManifest()
+
+    if installationManifest == nil then
+        fail("Download failed: " .. MANIFEST_SOURCE_PATH)
+        print("       Reason: " .. tostring(manifestError))
+        print("Installation aborted.")
+        print("No files were changed.")
+        return
+    end
+
+    ok("Manifest downloaded: " .. installationManifest.payloadID)
+
+    local installationPayload, payloadBytes, failedSource, payloadError =
+        downloadInstallationPayload(installationManifest)
+
+    if installationPayload == nil then
+        fail("Download failed: " .. tostring(failedSource))
+        print("       Reason: " .. tostring(payloadError))
+        print("Installation aborted.")
+        print("No files were changed.")
+        return
+    end
+
+    ok("Payload downloaded")
+    ok(tostring(#installationPayload) .. " files ready")
+    ok(formatByteCount(payloadBytes) .. " payload")
+
+    if not validatePayloadFreeSpace(payloadBytes) then
+        print("Installation aborted.")
+        print("No files were changed.")
+        return
+    end
 
     print()
     setStatusColor(colors.lime)

@@ -145,6 +145,13 @@ The installer must check both:
 - total filesystem capacity
 - currently available free space
 
+The network installer performs its capacity check during local preflight. Once
+the complete remote payload is in memory, it checks free space again against
+the actual number of content bytes which it is about to write. This is a
+payload-derived minimum rather than a permanently hard-coded free-space
+estimate; filesystem metadata and initial installation metadata may still add
+small implementation overhead.
+
 The installer must fail safely when requirements are not met.
 
 ---
@@ -270,21 +277,39 @@ The repository contains:
 
 This is the bootstrap installer.
 
-Future intended usage may resemble:
+Current development usage requires only the current installer file to be
+present locally:
 
-wget <URL> install.lua
+copy install.lua to /install.lua
 install
 
-The current development installer uses the repository as a fixed local
-payload. It reads Stage-0, init, Recovery, the shell, the logger, dickfetch,
-dicklog, and the current command files below `src/`, then writes them to their
-installed paths after confirmation. The installer writes Stage-0 last. A
-single-file download/bootstrap transport is not implemented yet and must not
-be confused with DickPkg or DickRepo.
+The installer fetches `manifest.lua` and every listed payload source from the
+public `nano-lin/DICK-OS` repository through GitHub's raw-content endpoint. The
+temporary development ref is `main`. Repository owner, repository name, and
+ref are separate installer constants so a later milestone can select a tag,
+release branch, or immutable commit without replacing the transport design.
+
+The manifest is deliberately small. Its format version identifies the data
+shape, its DICK/OS version and payload ID identify the intended development
+payload, and each file entry maps one repository-relative `src/...` source to
+one installed target. Validation accepts targets only below `/dickos/`, plus
+the exact `/startup.lua` Stage-0 target. Duplicate, malformed, unsafe, empty,
+or incorrectly ordered entries are rejected. This installation manifest is a
+bootstrap file list, not DickPkg, DickRepo, or the future installed integrity
+database.
+
+`main` is mutable. Fetching one manifest and its complete file list reduces
+accidental mixed-version installation, but it does not provide cryptographic
+integrity, authenticity, or stable release pinning. Those guarantees require a
+future release/signature design. Until then, the installer clearly identifies
+`main` as an unstable development channel. Because separate raw-file requests
+resolve that mutable ref independently, a branch update during one installation
+can still create a version race; pinning an immutable commit is the intended
+future correction for release transport.
 
 Installer flow:
 
-preflight
+local preflight
     |
     v
 hardware validation
@@ -294,6 +319,18 @@ storage validation
     |
     v
 existing installation detection
+    |
+    v
+HTTP availability and raw-domain permission check
+    |
+    v
+remote manifest fetch and validation
+    |
+    v
+complete payload fetch into memory
+    |
+    v
+payload-derived free-space check
     |
     v
 initial configuration
@@ -308,18 +345,38 @@ explicit confirmation
 filesystem deployment
     |
     v
-identity creation
+filesystem layout and initial metadata
     |
     v
-integrity manifest
+init, Recovery, shell, logger, and command files
     |
     v
-Stage-0 installation
+Stage-0 payload file installed last
     |
     v
-reboot
+startup settings transaction
+    |
+    v
+installation result; reboot remains explicit
 
-Nothing should be written before preflight and user confirmation complete.
+Every payload body must be fetched, read, and validated before the first
+persistent deployment write. Deployment performs no HTTP request and consumes
+only that in-memory payload. A missing manifest, blocked domain, timeout, 404,
+invalid response, malformed manifest, or failed payload download therefore
+aborts before filesystem deployment and leaves local system state unchanged.
+
+CC:T HTTP must be enabled and `raw.githubusercontent.com` must be allowed by
+the Minecraft server configuration. The installer detects the missing HTTP API
+and uses `http.checkURL` when that API is available, but it never changes server
+configuration itself.
+
+After explicit confirmation, deployment retains the existing rollback model.
+Stage-0 remains the final payload item written to `/startup.lua`, after its
+init, Recovery, shell, logger, and command dependencies. `install.lua` does not
+download, overwrite, or restart itself.
+
+Nothing persistent should be written before preflight, complete payload fetch,
+and user confirmation finish.
 
 An installation failure must not intentionally destroy unrelated user data.
 
