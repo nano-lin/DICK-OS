@@ -1015,10 +1015,16 @@ The implemented resolver is shared by execution and `which`, in this order:
 4. an explicit relative or absolute path when the typed name contains `/`.
 
 CraftOS PATH and aliases are never searched implicitly. Selected CraftOS ROM
-functionality may be wrapped explicitly; current `edit` loads the real ROM
-editor at `/rom/programs/edit.lua` and gives it an absolute path resolved from
-the DICK cwd. Leaving that editor returns to the protected DICK command call,
-not a CraftOS command prompt.
+functionality may be wrapped explicitly. Current `edit` resolves the requested
+path from the DICK cwd/home first, then loads the real ROM editor at
+`/rom/programs/edit.lua` inside a small compatibility environment. That
+environment exposes only `shell.resolve` from the shell-shaped API and binds it
+to the already absolute DICK path. It deliberately omits `openTab` and
+`switchTab`, so the editor does not advertise its Run action before DICK/OS has
+scheduler/job-control support. It does not publish the CraftOS shell globally.
+Leaving that editor returns to the protected DICK child-command call, not a
+CraftOS command prompt; editor runtime errors and Ctrl+T remain ordinary child
+outcomes handled by the existing shell boundary.
 
 The parser recognises whitespace plus matching single and double quotes.
 Unterminated input reports `Parse error: unterminated quote` and returns to the
