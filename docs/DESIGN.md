@@ -603,6 +603,7 @@ Target installed layout:
     │
     ├── lib/
     │   ├── log.lua
+    │   ├── editor_buffer.lua
     │   ├── config.lua
     │   ├── auth.lua
     │   ├── integrity.lua
@@ -1014,19 +1015,13 @@ The implemented resolver is shared by execution and `which`, in this order:
 3. `/dickos/bin/<command>.lua`;
 4. an explicit relative or absolute path when the typed name contains `/`.
 
-CraftOS PATH and aliases are never searched implicitly. Selected CraftOS ROM
-functionality may be wrapped explicitly. Current `edit` resolves the requested
-path from the DICK cwd/home first, then loads the real ROM editor at
-`/rom/programs/edit.lua` inside a small compatibility environment. That
-environment exposes only `shell.resolve` from the shell-shaped API and binds it
-to the already absolute DICK path. It deliberately omits `openTab` and
-`switchTab`, so the editor does not advertise its Run action before DICK/OS has
-scheduler/job-control support. The environment's `require` function and
-`package` table come from CC:T's bundled `cc/require.lua` package factory, using
-the ROM editor directory; internal editor modules are not injected one by one.
-It does not publish the CraftOS shell globally. Leaving that editor returns to
-the protected DICK child-command call, not a CraftOS command prompt; editor
-runtime errors and Ctrl+T remain ordinary child outcomes handled by the
+CraftOS PATH and aliases are never searched implicitly. The current `edit`
+command is a native DICK/OS program. It resolves its target from the DICK
+cwd/home context, uses a small DICK-owned buffer module, and depends only on
+public filesystem, terminal, key, colour, and event APIs. It does not load the
+CraftOS ROM editor, construct a CraftOS compatibility environment, or expose a
+CraftOS shell. Normal Quit returns to the protected DICK child-command call;
+editor runtime errors and Ctrl+T remain ordinary child outcomes handled by the
 existing shell boundary.
 
 The parser recognises whitespace plus matching single and double quotes.
@@ -1212,6 +1207,65 @@ The visual direction takes inspiration from:
 - character-based TUIs
 
 A pixel-based graphical desktop is not required for 0.1.0.
+
+## DICK EDIT v1
+
+`/dickos/bin/edit.lua` is the first native DICK/OS text editor. Its pure text
+model lives in `/dickos/lib/editor_buffer.lua`; the command file owns path and
+file handling, rendering, shortcuts, and the event loop. Neither component
+uses `/rom/programs/edit.lua`, a CraftOS shell, `multishell`, or private
+`cc.internal` modules.
+
+The command accepts exactly one target. Relative paths, `.` and `..` use the
+DICK command's cwd snapshot; `~` and `~/...` use its home; absolute paths stay
+absolute; parent traversal clamps at `/`. A missing target begins as one empty,
+clean line and is not created until Save. Directories and files larger than
+256 KiB are rejected before editing. Existing files are read completely, and
+new input is refused before the in-memory document would cross the same limit.
+
+The buffer is a list of lines without newline characters. It always contains
+at least one line, uses one-based line/column cursors, and preserves trailing
+empty lines. Save joins lines with LF and adds no unconditional final newline.
+CRLF and lone-CR input are normalised to LF when loaded or pasted, so saving
+such a document follows one explicit CC:T newline policy.
+
+The Advanced Computer TUI has a black background, adaptive line-number width,
+a horizontally clipped unwrapped text viewport, automatic vertical and
+horizontal scrolling, a dirty marker, cursor coordinates, and Save/Quit hints.
+It uses ASCII separators rather than raw UTF-8 box characters. A terminal
+smaller than 42 by 7 cells receives a clear error and returns to the shell.
+
+Editor v1 keys are:
+
+- character input: insert printable text;
+- Enter: split the current line;
+- Backspace/Delete: remove a character or join adjacent lines;
+- Tab: insert four spaces;
+- Left/Right/Up/Down, Home/End, PageUp/PageDown: move the cursor;
+- Ctrl+S: write the complete buffer and clear dirty state only after open,
+  write, and close all succeed;
+- Ctrl+Q: quit immediately when clean; when dirty, show a warning first and
+  require a second non-repeated Ctrl+Q to discard;
+- Escape: cancel the pending discard confirmation;
+- plain CC:T paste events: insert text, including newline splitting.
+
+A failed Save leaves the editor open and dirty with a visible diagnostic.
+Editor v1 uses a direct CC:T write after a writable handle is obtained; it does
+not yet implement atomic temporary-file replacement. Normal exit resets the
+terminal to a sane black/white state, with the DICK shell's existing terminal
+hygiene remaining the final safety boundary.
+
+The event loop deliberately calls `os.pullEvent`, not `os.pullEventRaw`.
+Ctrl+T therefore terminates the editor immediately as a child command, even
+with unsaved changes. The DICK shell reports `Command terminated.`, restores
+the same session/prompt, and does not enter Recovery or CraftOS. The editor
+does not log keystrokes, pasted text, or buffer contents; current diagnostics
+remain the shell's best-effort child failure/termination records.
+
+Deferred DICK EDIT v2 work includes native syntax highlighting, search and
+replace, goto line, undo/redo, selection, copy/cut clipboard operations, mouse
+positioning, bracket matching, auto-indent, configurable tab width, read-only
+mode, multiple buffers, and tabs. Editor v1 has no scheduler-backed Run action.
 
 ## Visual language
 

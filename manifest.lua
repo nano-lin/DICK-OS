@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-main-shell-foundation",
+    payloadID = "dickos-0.1.0-unstable-native-editor",
 
     files = {
         {
@@ -26,6 +26,10 @@ return {
         {
             source = "src/dickos/lib/log.lua",
             target = "/dickos/lib/log.lua",
+        },
+        {
+            source = "src/dickos/lib/editor_buffer.lua",
+            target = "/dickos/lib/editor_buffer.lua",
         },
         {
             source = "src/dickos/bin/dickfetch.lua",

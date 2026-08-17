@@ -330,7 +330,7 @@ for sourcePath in sourceProcess:lines() do
 end
 
 assert(sourceProcess:close())
-assert(#manifest.files == 18)
+assert(#manifest.files == 19)
 
 for _, manifestFile in ipairs(manifest.files) do
     assert(discoveredSources[manifestFile.source],
