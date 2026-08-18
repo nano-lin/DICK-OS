@@ -319,18 +319,22 @@ local function assertNoPersistentMutation(state)
     end
 end
 
--- The manifest must cover every current Lua payload source exactly once. The
--- host `find` command deliberately derives this list from the repository tree
--- instead of duplicating the installer's historical file count.
+-- The manifest must cover every current Lua payload and versioned config
+-- template exactly once. The host `find` command derives this list from the
+-- repository tree instead of duplicating a historical payload count.
 local discoveredSources = {}
-local sourceProcess = assert(io.popen("find src -type f -name '*.lua' -print"))
+local discoveredSourceCount = 0
+local sourceProcess = assert(io.popen(
+    "find src -type f \\( -name '*.lua' -o -name '*.cfg' \\) -print"
+))
 
 for sourcePath in sourceProcess:lines() do
     discoveredSources[sourcePath] = true
+    discoveredSourceCount = discoveredSourceCount + 1
 end
 
 assert(sourceProcess:close())
-assert(#manifest.files == 19)
+assert(#manifest.files == discoveredSourceCount)
 
 for _, manifestFile in ipairs(manifest.files) do
     assert(discoveredSources[manifestFile.source],
@@ -342,11 +346,38 @@ assert(next(discoveredSources) == nil, "manifest omits a current source file")
 assert(manifest.files[#manifest.files].source == "src/startup.lua")
 assert(manifest.files[#manifest.files].target == "/startup.lua")
 
+local expectedConfigurationTargets = {
+    ["src/dickos/lib/config.lua"] = "/dickos/lib/config.lua",
+    ["src/dickos/etc/system.cfg"] = "/dickos/etc/system.cfg",
+    ["src/dickos/etc/network.cfg"] = "/dickos/etc/network.cfg",
+    ["src/dickos/etc/services.cfg"] = "/dickos/etc/services.cfg",
+}
+
+for _, manifestFile in ipairs(manifest.files) do
+    local expectedTarget = expectedConfigurationTargets[manifestFile.source]
+
+    if expectedTarget ~= nil then
+        assert(manifestFile.target == expectedTarget)
+        expectedConfigurationTargets[manifestFile.source] = nil
+    end
+end
+
+assert(next(expectedConfigurationTargets) == nil,
+    "manifest omits a configuration payload")
+
 local success = runScenario({})
 assert(#success.requests == #manifest.files + 1)
 assert(success.requests[1] == "manifest.lua")
 assert(success.files["/startup.lua"] == payloadBodies["src/startup.lua"])
 assert(success.openedWritePaths[#success.openedWritePaths] == "/startup.lua")
+assert(success.files["/dickos/lib/config.lua"] ==
+    payloadBodies["src/dickos/lib/config.lua"])
+assert(success.files["/dickos/etc/system.cfg"] ==
+    payloadBodies["src/dickos/etc/system.cfg"])
+assert(success.files["/dickos/etc/network.cfg"] ==
+    payloadBodies["src/dickos/etc/network.cfg"])
+assert(success.files["/dickos/etc/services.cfg"] ==
+    payloadBodies["src/dickos/etc/services.cfg"])
 
 local lastHTTPAction = 0
 local firstDeploymentAction = nil

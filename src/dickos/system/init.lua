@@ -7,8 +7,34 @@ local MACHINE_ID_PATH = "/dickos/etc/machine-id"
 local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
 local SHELL_PATH = "/dickos/system/shell.lua"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
+local CONFIG_LIBRARY_PATH = "/dickos/lib/config.lua"
+local SYSTEM_CONFIG_PATH = "/dickos/etc/system.cfg"
 local STAGE0_RESTART_RESULT = "restart"
 local EXPECTED_RUNTIME_API_VERSION = 1
+
+-- Schemas are ordinary data tables consumed by the shared config library.
+-- Init owns these two current system settings because it applies the boot
+-- setting and passes only the history limit needed by the shell. Neither the
+-- full parsed table nor unrelated future configuration enters runtimeContext.
+local SYSTEM_CONFIG_SCHEMA = {
+    formatVersion = 1,
+    entries = {
+        ["format_version"] = {
+            type = "integer",
+            default = 1,
+        },
+        ["boot.cosmetic_delay"] = {
+            type = "boolean",
+            default = true,
+        },
+        ["shell.history_limit"] = {
+            type = "integer",
+            default = 64,
+            min = 0,
+            max = 256,
+        },
+    },
+}
 
 -- Full DICK/OS supports the Advanced Computer, so its colour terminal is a
 -- platform baseline rather than an optional skin. These constants begin a
@@ -102,6 +128,130 @@ end
 local bootLogger = createBestEffortLogger("boot", runtimeContext)
 local systemLogger = createBestEffortLogger("system", runtimeContext)
 
+-- Configuration parsing is normal core functionality, unlike best-effort
+-- diagnostics. A missing, syntactically broken, or malformed config library
+-- therefore raises an init error into Stage-0 Recovery. User-editable config
+-- file failures are handled later by the valid library's defaults policy.
+local function requireConfigurationLibrary()
+    local loadSucceeded, programOrError, compileError = pcall(
+        loadfile,
+        CONFIG_LIBRARY_PATH
+    )
+
+    if not loadSucceeded or type(programOrError) ~= "function" then
+        local failure = loadSucceeded and compileError or programOrError
+        local message = "Unable to load configuration core: " ..
+            tostring(failure)
+
+        logBestEffort(bootLogger, "error", "config", message)
+        error(message, 0)
+    end
+
+    local runSucceeded, moduleOrError = pcall(programOrError)
+
+    if not runSucceeded or type(moduleOrError) ~= "table" then
+        local message = "Unable to start configuration core: " ..
+            tostring(moduleOrError)
+
+        logBestEffort(bootLogger, "error", "config", message)
+        error(message, 0)
+    end
+
+    local requiredFunctions = {
+        "parse",
+        "load",
+        "validate",
+        "write",
+        "get",
+    }
+
+    for _, functionName in ipairs(requiredFunctions) do
+        if type(moduleOrError[functionName]) ~= "function" then
+            local message = "Configuration core is missing " ..
+                functionName .. "."
+
+            logBestEffort(bootLogger, "error", "config", message)
+            error(message, 0)
+        end
+    end
+
+    logBestEffort(
+        bootLogger,
+        "info",
+        "config",
+        "Configuration library loaded"
+    )
+    logBestEffort(
+        systemLogger,
+        "info",
+        "config",
+        "Configuration library loaded"
+    )
+    return moduleOrError
+end
+
+-- Load system.cfg behind a core-library boundary. `config.load` treats file
+-- problems as data failures and returns defaults plus warnings. If the library
+-- itself crashes or violates its API, init treats that as a core failure.
+local function loadSystemConfiguration(configModule)
+    local callSucceeded, valuesOrError, warnings, status = pcall(
+        configModule.load,
+        SYSTEM_CONFIG_PATH,
+        SYSTEM_CONFIG_SCHEMA
+    )
+
+    if not callSucceeded then
+        local message = "Configuration core failed while loading system.cfg: " ..
+            tostring(valuesOrError)
+
+        logBestEffort(bootLogger, "error", "config", message)
+        error(message, 0)
+    end
+
+    if type(valuesOrError) ~= "table" or type(warnings) ~= "table" or
+        type(status) ~= "table" or type(status.loaded) ~= "boolean" then
+        local message = "Configuration core returned an invalid load result."
+
+        logBestEffort(bootLogger, "error", "config", message)
+        error(message, 0)
+    end
+
+    for _, warning in ipairs(warnings) do
+        logBestEffort(bootLogger, "warn", "config", warning)
+        logBestEffort(systemLogger, "warn", "config", warning)
+    end
+
+    if status.loaded then
+        logBestEffort(
+            bootLogger,
+            "info",
+            "config",
+            "System configuration loaded"
+        )
+        logBestEffort(
+            systemLogger,
+            "info",
+            "config",
+            "System configuration loaded"
+        )
+    else
+        logBestEffort(
+            bootLogger,
+            "warn",
+            "config",
+            "System configuration defaults active"
+        )
+        logBestEffort(
+            systemLogger,
+            "warn",
+            "config",
+            "System configuration defaults active"
+        )
+    end
+
+    return valuesOrError
+end
+
 -- Each stage is a small Lua table containing the text shown to the user and
 -- its current visual state. This is enough structure for later init work to
 -- add real bootstrap stages without creating a generic boot framework now.
@@ -111,6 +261,7 @@ local BOOT_STAGES = {
     { label = "Version metadata", state = "pending" },
     { label = "Machine identity", state = "pending" },
     { label = "Hostname metadata", state = "pending" },
+    { label = "Configuration", state = "pending" },
     { label = "Bootstrap session", state = "pending" },
 }
 
@@ -403,14 +554,24 @@ local function waitForBootFrame()
     end
 end
 
--- Animate only the visual representation of the already validated bootstrap.
--- Five stages with four short frames each produce roughly one second of visual
--- motion on CC:T's tick-based timer. No fake subsystem work is hidden behind
--- this delay, and a later milestone can replace each stage with real work.
-local function animateBootProgress()
+-- Animate only the visual representation of the already completed bootstrap
+-- work. When cosmetic delay is disabled, the same real stages render directly
+-- in their complete state without starting timers or waiting for frame events.
+-- With delay enabled, each stage retains the existing four short visual frames.
+local function animateBootProgress(cosmeticDelayEnabled)
     local totalFrames = #BOOT_STAGES * BOOT_FRAMES_PER_STAGE
 
     drawAllBootStages()
+
+    if not cosmeticDelayEnabled then
+        for _, stage in ipairs(BOOT_STAGES) do
+            stage.state = "ok"
+        end
+
+        drawAllBootStages()
+        drawProgressBar(100, "Bootstrap complete")
+        return true
+    end
 
     for stageIndex, stage in ipairs(BOOT_STAGES) do
         stage.state = "active"
@@ -520,10 +681,31 @@ logBestEffort(bootLogger, "info", "init", "Hostname metadata loaded")
 local machineID = requireValue(MACHINE_ID_PATH, "machine ID")
 logBestEffort(bootLogger, "info", "init", "Machine ID metadata loaded")
 
+local configModule = requireConfigurationLibrary()
+local systemConfiguration = loadSystemConfiguration(configModule)
+local bootCosmeticDelay = configModule.get(
+    systemConfiguration,
+    "boot.cosmetic_delay"
+)
+local shellHistoryLimit = configModule.get(
+    systemConfiguration,
+    "shell.history_limit"
+)
+
+if type(bootCosmeticDelay) ~= "boolean" or
+    type(shellHistoryLimit) ~= "number" or
+    shellHistoryLimit ~= math.floor(shellHistoryLimit) or
+    shellHistoryLimit < 0 or shellHistoryLimit > 256 then
+    local message = "Configuration core returned invalid system settings."
+
+    logBestEffort(bootLogger, "error", "config", message)
+    error(message, 0)
+end
+
 logBestEffort(bootLogger, "info", "init", "Normal boot UI starting")
 drawBootHeader(version)
 
-if not animateBootProgress() then
+if not animateBootProgress(bootCosmeticDelay) then
     logBestEffort(
         bootLogger,
         "warn",
@@ -570,6 +752,7 @@ local shellContext = {
     machineID = machineID,
     user = "bootstrap",
     home = "/dickos/home/bootstrap",
+    shellHistoryLimit = shellHistoryLimit,
 }
 
 logBestEffort(bootLogger, "info", "init", "DICK shell starting")

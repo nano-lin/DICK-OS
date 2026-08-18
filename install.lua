@@ -948,9 +948,10 @@ local function writeTextFile(path, contents)
     return true, nil
 end
 
--- Only the three metadata files implemented by this milestone are deployed.
--- Each table entry names both its destination and its exact value; no fake
--- user, service, network, or integrity databases are created.
+-- Installation identity remains separate from versioned configuration
+-- templates. These three values are generated for this machine, while the
+-- manifest deploys system.cfg, network.cfg, and services.cfg from `src/` so
+-- their defaults are not duplicated inside the installer.
 local function writeInitialMetadata(hostname, machineID)
     local metadataFiles = {
         {
@@ -1206,7 +1207,7 @@ local function printSuccess(hostname, ownerUsername, machineID)
     print("Hostname:   " .. hostname)
     print("Owner:      " .. ownerUsername)
     print()
-    print("Stage-0, init, Recovery, logging, and the DICK shell are installed.")
+    print("Stage-0, init, Recovery, configuration, logging, and shell installed.")
     print("Interactive session: bootstrap (authentication is not implemented).")
     print("Reboot or power on the computer to enter DICK/OS.")
     print()

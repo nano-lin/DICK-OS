@@ -348,7 +348,7 @@ filesystem deployment
 filesystem layout and initial metadata
     |
     v
-init, Recovery, shell, logger, and command files
+init, Recovery, shell, shared libraries, configuration templates, and commands
     |
     v
 Stage-0 payload file installed last
@@ -372,8 +372,10 @@ configuration itself.
 
 After explicit confirmation, deployment retains the existing rollback model.
 Stage-0 remains the final payload item written to `/startup.lua`, after its
-init, Recovery, shell, logger, and command dependencies. `install.lua` does not
-download, overwrite, or restart itself.
+init, Recovery, shell, logger, configuration, and command dependencies.
+`install.lua` does not download, overwrite, or restart itself. Configuration
+templates are ordinary versioned payload files; the installer does not keep a
+second embedded copy of their defaults.
 
 Nothing persistent should be written before preflight, complete payload fetch,
 and user confirmation finish.
@@ -653,6 +655,10 @@ src/
 The repository tree does not need to perfectly mirror the installed tree,
 but mapping between source paths and installed paths must remain obvious.
 
+The configuration-foundation milestone installs `config.lua`, `system.cfg`,
+`network.cfg`, and `services.cfg`. `users.db` remains a future authentication
+file shown in the target layout; it is not created by this milestone.
+
 ---
 
 # 13. Stage-0
@@ -801,15 +807,20 @@ init.lua a giant file.
 The current implemented handoff is:
 
 ```text
-init -> boot presentation -> dickfetch -> /dickos/system/shell.lua
+init -> persistent system configuration -> boot presentation
+     -> dickfetch -> /dickos/system/shell.lua
 ```
 
 Init combines Stage-0's runtime API version and Boot ID with the installed
 version, hostname, and Machine ID. It adds the temporary bootstrap-session user
-and home, then passes one in-memory table to the shell. Boot ID is never written
-to disk. A missing, invalid, crashing, or unexpectedly returning core shell is
-an init failure and therefore reaches existing Stage-0 Recovery. This core
-contract is separate from the shell's protected child-command boundary.
+and home, loads `/dickos/etc/system.cfg` through the required configuration
+library, then passes one in-memory table to the shell. Only the validated
+`shell.history_limit` value joins that shell session table; arbitrary parsed
+configuration is not forwarded to commands. Boot ID is never written to disk.
+A missing or broken configuration library, or a missing, invalid, crashing, or
+unexpectedly returning core shell, is an init failure and therefore reaches
+existing Stage-0 Recovery. This core contract is separate from user config
+data failures and the shell's protected child-command boundary.
 
 ---
 
@@ -839,6 +850,7 @@ The current minimal init then animates only real bootstrap stages:
 [ OK ] Version metadata
 [ .. ] Machine identity
 [    ] Hostname metadata
+[    ] Configuration
 [    ] Bootstrap session
 
 Activity: Machine identity
@@ -884,33 +896,113 @@ Example:
 
 This delay is cosmetic.
 
-The minimal bootstrap may use approximately one second of short timer frames to
-make progress movement legible. The animation must preserve terminate handling
-and must not imply that nonexistent subsystem work is occurring.
+With `boot.cosmetic_delay = true`, the minimal bootstrap uses short timer frames
+to make progress movement legible. With it set to `false`, init renders the same
+real stages as complete without intentionally waiting between cosmetic frames.
+The animation must preserve terminate containment and must not imply that
+nonexistent subsystem work is occurring.
 
 Real initialization must not be extended merely to make the system appear
 slower. When a stage later performs actual work, that work and any cosmetic
 frame delay remain conceptually separate.
 
-Future versions may allow the user to skip cosmetic delays while real boot work
-continues normally.
+This setting is read once during init. Editing it does not alter an already
+running boot/session; the new value takes effect on the next init or reboot.
 
 ---
 
 # 19. Configuration
 
-Configuration must not be hard-coded throughout the Lua source.
+`/dickos/lib/config.lua` is the shared parser, schema validator, loader, and
+writer for persistent configuration below `/dickos/etc`. Configuration is data,
+not Lua: values are never passed to `load`, `loadstring`, or another execution
+mechanism.
 
-Persistent configuration belongs in dedicated files such as:
+## Config format v1
 
-/dickos/etc/system.cfg
-/dickos/etc/network.cfg
-/dickos/etc/services.cfg
-/dickos/etc/users.db
+Version 1 is a deliberately small line-oriented key/value format:
 
-Shared configuration parsing/writing belongs in:
+```text
+# DICK/OS system configuration
 
-/dickos/lib/config.lua
+format_version = 1
+boot.cosmetic_delay = true
+shell.history_limit = 64
+```
+
+Its grammar is:
+
+- one `key = value` assignment per non-comment line;
+- blank lines and full-line comments whose first non-whitespace character is
+  `#` are ignored;
+- keys are lowercase identifier segments separated by dots; every segment
+  starts with `a-z` and continues with `a-z`, `0-9`, or `_`;
+- duplicate keys are invalid rather than last-write-wins;
+- values are `true`, `false`, finite decimal numbers with an optional `e`/`E`
+  exponent, or quoted strings;
+- quoted strings support only `\\`, `\"`, `\n`, `\r`, and `\t` escapes;
+- arrays, tables, inline comments, functions, and executable chunks are not
+  part of format v1.
+
+Parser failures include the source name and line number when a line is known.
+Parsing produces a flat table but does not decide which subsystem keys are
+valid. Each subsystem supplies an ordinary Lua schema whose entries describe a
+type, safe default, optional numeric minimum/maximum, and optional allowed
+values. Validation is a separate step:
+
+- a missing known key receives its default;
+- an invalid known value receives its default and produces a warning;
+- an unknown key is retained for forward compatibility and produces a warning;
+- a supported file with some invalid values may keep its other valid values;
+- an unsupported `format_version` rejects the whole file as a usable source,
+  so DICK/OS never partially interprets an unknown format.
+
+The public module operations are `parse`, `validate`, `load`, `get`,
+`serialize`, and `write`; `defaults` exposes a fresh schema-default table for
+callers which need it. `load` applies a defensive 64 KiB limit. A missing,
+unreadable, oversized, malformed, or unsupported-format user file returns safe
+defaults plus warnings and is not automatically overwritten during boot.
+
+This failure policy deliberately distinguishes code from data. A missing,
+syntactically broken, crashing, or API-incompatible `/dickos/lib/config.lua` is
+a core init failure and follows the existing Stage-0 Recovery path. A typo or
+bad value in user-editable `system.cfg` logs WARN best-effort, activates safe
+defaults for the affected scope, and continues normal boot. Logger failure
+remains non-fatal, and configuration contents are never copied into logs.
+
+The initial `/dickos/etc/system.cfg` contains only:
+
+```text
+format_version = 1
+boot.cosmetic_delay = true
+shell.history_limit = 64
+```
+
+`boot.cosmetic_delay` controls only intentional visual waits. The real init
+work and Ctrl+T containment are unchanged. `shell.history_limit` is an integer
+from 0 through 256: zero disables the in-memory session history, while a
+positive value retains only that many newest non-blank commands. History is
+neither persisted nor logged.
+
+`network.cfg` and `services.cfg` currently contain only `format_version = 1`
+plus explanatory comments. They reserve real versioned files for future
+DickNet and dickd schemas without enabling a network subsystem, fake services,
+or autostart. `users.db` is not created; authentication remains a later
+milestone and the installer password remains non-persistent.
+
+`serialize` emits deterministic canonical syntax with `format_version` first
+and remaining keys sorted. Programmatic writing preserves scalar values but may
+replace comments, whitespace, and original ordering. `write` first writes and
+closes `<target>.tmp`, moves an existing target to `<target>.bak`, installs the
+complete temporary file, and restores the backup where practical if the final
+move fails. A retained backup is never erased while its target is missing.
+Successful replacement cleans both reserved artifacts. This is a small
+best-effort config transaction, not a general filesystem transaction framework.
+
+There is no live reload or config-management CLI. Changes take effect on the
+next init/reboot and can currently be inspected or edited with ordinary DICK
+commands such as `cat /dickos/etc/system.cfg` and
+`edit /dickos/etc/system.cfg`.
 
 ---
 
@@ -1028,7 +1120,8 @@ The parser recognises whitespace plus matching single and double quotes.
 Unterminated input reports `Parse error: unterminated quote` and returns to the
 prompt. Pipes, redirection, substitution, escaping, globbing, scripts,
 background jobs, aliases, and job control are not implemented. `read` provides
-in-memory history for the current session only.
+in-memory history for the current session only, bounded by the validated
+`shell.history_limit`; zero disables it.
 
 Every external program is compiled and executed behind protected calls. A load
 or runtime failure prints the exact child diagnostic when available, writes a
@@ -1761,12 +1854,14 @@ progress, Recovery decisions, and fallback transitions. Its Boot ID groups
 Ctrl+T init restarts and Recovery retries under the same Stage-0 execution. A
 new Stage-0 execution appends a new marker and normally has a new Boot ID.
 `system.log` begins the longer-lived system/session diagnostic stream. Init
-records bootstrap-session readiness, and the shell records startup, missing
-commands, ordinary command termination, and child load/runtime failures. Shell
-records include the resolved command name but deliberately omit the complete
-raw argument line so future secrets are not blindly copied into logs. Reboot
-and shutdown requests are also logged best-effort before invoking the real
-power API.
+records configuration-library loading, system-config loading/default fallback,
+and bootstrap-session readiness. Configuration WARN records describe paths,
+keys, and diagnostics but never contain the complete file contents. The shell
+records startup, missing commands, ordinary command termination, and child
+load/runtime failures. Shell records include the resolved command name but
+deliberately omit the complete raw argument line so future secrets are not
+blindly copied into logs. Reboot and shutdown requests are also logged
+best-effort before invoking the real power API.
 
 Both files are bounded before appending a record which would cross their limit:
 

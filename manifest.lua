@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-native-editor",
+    payloadID = "dickos-0.1.0-unstable-configuration-foundation",
 
     files = {
         {
@@ -28,8 +28,24 @@ return {
             target = "/dickos/lib/log.lua",
         },
         {
+            source = "src/dickos/lib/config.lua",
+            target = "/dickos/lib/config.lua",
+        },
+        {
             source = "src/dickos/lib/editor_buffer.lua",
             target = "/dickos/lib/editor_buffer.lua",
+        },
+        {
+            source = "src/dickos/etc/system.cfg",
+            target = "/dickos/etc/system.cfg",
+        },
+        {
+            source = "src/dickos/etc/network.cfg",
+            target = "/dickos/etc/network.cfg",
+        },
+        {
+            source = "src/dickos/etc/services.cfg",
+            target = "/dickos/etc/services.cfg",
         },
         {
             source = "src/dickos/bin/dickfetch.lua",

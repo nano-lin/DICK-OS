@@ -76,6 +76,16 @@ local function validateSessionContext(context)
     if string.sub(context.home, 1, 1) ~= "/" then
         error("DICK shell home directory must be an absolute path.", 0)
     end
+
+    if type(context.shellHistoryLimit) ~= "number" or
+        context.shellHistoryLimit ~= math.floor(context.shellHistoryLimit) or
+        context.shellHistoryLimit < 0 or
+        context.shellHistoryLimit > 256 then
+        error(
+            "DICK shell context contains an invalid history limit.",
+            0
+        )
+    end
 end
 
 validateSessionContext(sessionContext)
@@ -746,10 +756,25 @@ ensureHomeDirectory()
 logBestEffort("info", "shell", "Shell started")
 
 -- `read(nil, history)` uses CC:T's built-in in-memory up/down history support.
--- Nothing is written to disk. A first blank line separates the successful
--- dickfetch presentation from the initial prompt; later command output remains
--- on screen and is not cleared automatically.
+-- The configured limit applies only to this running shell and is never written
+-- back to disk or logs. Zero leaves the table empty and disables history.
 local commandHistory = {}
+local commandHistoryLimit = sessionContext.shellHistoryLimit
+
+-- Remember only non-blank commands. A Lua table used as a list grows at its
+-- numeric end; when it exceeds the configured bound, `table.remove(..., 1)`
+-- discards the oldest item and shifts the remaining recent entries down.
+local function rememberCommand(line)
+    if commandHistoryLimit == 0 or string.match(line, "%S") == nil then
+        return
+    end
+
+    commandHistory[#commandHistory + 1] = line
+
+    while #commandHistory > commandHistoryLimit do
+        table.remove(commandHistory, 1)
+    end
+end
 
 restoreShellTerminal()
 moveToFreshLineIfNeeded()
@@ -776,9 +801,7 @@ while true do
     else
         local line = tostring(lineOrError)
 
-        if string.match(line, "%S") then
-            commandHistory[#commandHistory + 1] = line
-        end
+        rememberCommand(line)
 
         local tokens, parseError = parseCommandLine(line)
 
