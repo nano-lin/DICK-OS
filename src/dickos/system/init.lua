@@ -10,6 +10,7 @@ local LOGIN_PATH = "/dickos/system/login.lua"
 local AUTH_LIBRARY_PATH = "/dickos/lib/auth.lua"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 local CONFIG_LIBRARY_PATH = "/dickos/lib/config.lua"
+local HARDWARE_LIBRARY_PATH = "/dickos/lib/hardware.lua"
 local SYSTEM_CONFIG_PATH = "/dickos/etc/system.cfg"
 local STAGE0_RESTART_RESULT = "restart"
 local EXPECTED_RUNTIME_API_VERSION = 1
@@ -253,6 +254,89 @@ local function loadSystemConfiguration(configModule)
     end
 
     return valuesOrError
+end
+
+-- Load the hardware subsystem as noncritical operating-system functionality.
+-- Unlike configuration/authentication, a missing or malformed hardware module
+-- must not prevent login. The failure is logged honestly and nil disables only
+-- initial discovery plus hotplug monitoring; it is never reported as an empty
+-- successful topology.
+local function loadHardwareSubsystem()
+    local loadSucceeded, programOrError, compileError = pcall(
+        loadfile,
+        HARDWARE_LIBRARY_PATH
+    )
+
+    if not loadSucceeded or type(programOrError) ~= "function" then
+        local failure = loadSucceeded and compileError or programOrError
+        local message = "Hardware discovery unavailable: unable to load " ..
+            "hardware core: " .. tostring(failure)
+
+        logBestEffort(bootLogger, "warn", "hardware", message)
+        logBestEffort(systemLogger, "error", "hardware", message)
+        return nil
+    end
+
+    local runSucceeded, moduleOrError = pcall(programOrError)
+
+    if not runSucceeded or type(moduleOrError) ~= "table" or
+        type(moduleOrError.scan) ~= "function" or
+        type(moduleOrError.watch) ~= "function" then
+        local message = "Hardware discovery unavailable: hardware core " ..
+            "returned an invalid API"
+
+        logBestEffort(bootLogger, "warn", "hardware", message)
+        logBestEffort(systemLogger, "error", "hardware", message)
+        return nil
+    end
+
+    return moduleOrError
+end
+
+-- Perform one real scan before authentication/session runtime begins. Every
+-- peripheral boundary is isolated inside hardware.lua; this final `pcall`
+-- protects init from a damaged replacement module. Zero devices is a valid
+-- successful result, while nil/invalid data is logged as unavailable.
+local function performInitialHardwareDiscovery(hardwareModule)
+    if hardwareModule == nil then
+        return
+    end
+
+    local scanSucceeded, descriptors, warnings, scanError = pcall(
+        hardwareModule.scan
+    )
+
+    if not scanSucceeded then
+        local message = "Initial hardware discovery failed: " ..
+            tostring(descriptors)
+
+        logBestEffort(bootLogger, "warn", "hardware", message)
+        logBestEffort(systemLogger, "error", "hardware", message)
+        return
+    end
+
+    if type(descriptors) ~= "table" or type(warnings) ~= "table" then
+        local message = "Initial hardware discovery returned invalid data"
+
+        if scanError ~= nil then
+            message = message .. ": " .. tostring(scanError)
+        end
+
+        logBestEffort(bootLogger, "warn", "hardware", message)
+        logBestEffort(systemLogger, "error", "hardware", message)
+        return
+    end
+
+    for _, warning in ipairs(warnings) do
+        logBestEffort(bootLogger, "warn", "hardware", warning)
+        logBestEffort(systemLogger, "warn", "hardware", warning)
+    end
+
+    local message = "Initial hardware discovery completed: " ..
+        tostring(#descriptors) .. " peripherals"
+
+    logBestEffort(bootLogger, "info", "hardware", message)
+    logBestEffort(systemLogger, "info", "hardware", message)
 end
 
 -- Authentication code and users.db are security-critical state. Unlike the
@@ -771,6 +855,121 @@ local function runShell(context)
         tostring(shellResult)
 end
 
+-- Accept one data-only hotplug record from hardware.lua and append it to the
+-- existing system.log. Attach query warnings are emitted separately; detach
+-- records need only the opaque name because the device may already be gone.
+local function logHardwareEvent(eventRecord, warnings, eventError)
+    if type(warnings) == "table" then
+        for _, warning in ipairs(warnings) do
+            logBestEffort(systemLogger, "warn", "hardware", warning)
+        end
+    end
+
+    if eventError ~= nil then
+        logBestEffort(
+            systemLogger,
+            "warn",
+            "hardware",
+            "Hotplug event query failed: " .. tostring(eventError)
+        )
+        return
+    end
+
+    if type(eventRecord) ~= "table" or
+        type(eventRecord.message) ~= "string" then
+        logBestEffort(
+            systemLogger,
+            "warn",
+            "hardware",
+            "Hardware watcher received an invalid event description"
+        )
+        return
+    end
+
+    local level = eventRecord.level == "warn" and "warn" or "info"
+
+    logBestEffort(systemLogger, level, "hardware", eventRecord.message)
+end
+
+-- A malformed replacement watcher is isolated from authentication and shell.
+-- If it returns or raises, record the failure and become an inert raw-event
+-- listener. Keeping this coroutine alive matters because `parallel.waitForAny`
+-- stops the other task when either function finishes; the session must remain
+-- the only task which can normally complete.
+local function runResilientHardwareWatcher(hardwareModule)
+    local watcherSucceeded, watcherError = pcall(
+        hardwareModule.watch,
+        logHardwareEvent
+    )
+
+    local message
+
+    if watcherSucceeded then
+        message = "Hardware watcher stopped unexpectedly"
+    else
+        message = "Hardware watcher failed: " .. tostring(watcherError)
+    end
+
+    logBestEffort(systemLogger, "error", "hardware", message)
+
+    while true do
+        -- Raw handling makes Ctrl+T an ignored event in this degraded watcher.
+        -- The parallel session task receives its own copy and retains the
+        -- established login/shell/editor/sudo policy.
+        os.pullEventRaw()
+    end
+end
+
+-- Run exactly one watcher beside the complete login/logout/session lifecycle.
+-- CC:T's public parallel API gives each coroutine its own event-queue view, so
+-- the watcher observes hotplug events without consuming keyboard, mouse,
+-- timer, or terminate events needed by login, read(), sudo, and child commands.
+local function runWithHardwareWatcher(sessionLifecycle, hardwareModule)
+    if hardwareModule == nil then
+        return sessionLifecycle()
+    end
+
+    if type(parallel) ~= "table" or
+        type(parallel.waitForAny) ~= "function" or
+        type(os) ~= "table" or type(os.pullEventRaw) ~= "function" then
+        logBestEffort(
+            systemLogger,
+            "error",
+            "hardware",
+            "Hardware watcher unavailable: parallel/raw event API missing"
+        )
+        return sessionLifecycle()
+    end
+
+    local sessionFinished = false
+    local sessionSucceeded = false
+    local sessionResult = nil
+
+    local function protectedSessionLifecycle()
+        sessionSucceeded, sessionResult = pcall(sessionLifecycle)
+        sessionFinished = true
+    end
+
+    local function hardwareWatcherLifecycle()
+        runResilientHardwareWatcher(hardwareModule)
+    end
+
+    parallel.waitForAny(
+        protectedSessionLifecycle,
+        hardwareWatcherLifecycle
+    )
+
+    if not sessionFinished then
+        error("Runtime scheduler ended before the session lifecycle.", 0)
+    end
+
+    if not sessionSucceeded then
+        error(sessionResult, 0)
+    end
+
+    return sessionResult
+end
+
 prepareTerminal()
 logBestEffort(bootLogger, "info", "init", "init started")
 
@@ -803,6 +1002,8 @@ if type(bootCosmeticDelay) ~= "boolean" or
     error(message, 0)
 end
 
+local hardwareModule = loadHardwareSubsystem()
+performInitialHardwareDiscovery(hardwareModule)
 
 -- Keep the returned module alive only as proof that all authentication core
 -- dependencies compiled and users.db validated. Login loads the same stateless
@@ -849,70 +1050,80 @@ local loginContext = {
 -- same login context begins another authentication attempt under the same
 -- Stage-0 Boot ID. Every successful authentication gets a fresh dickfetch
 -- presentation before its shell; no presentation runs before credentials.
--- Any other shell/login return remains a core failure.
-while true do
-    logBestEffort(bootLogger, "info", "login", "DICK login starting")
-    local authenticatedUser, loginError = runLogin(loginContext)
+-- Any other shell/login return remains a core failure. This entire lifecycle
+-- is one parallel task, so logout never creates another hardware watcher.
+local function runSessionLifecycle()
+    while true do
+        logBestEffort(bootLogger, "info", "login", "DICK login starting")
+        local authenticatedUser, loginError = runLogin(loginContext)
 
-    if authenticatedUser == nil then
-        logBestEffort(bootLogger, "error", "login", loginError)
-        logBestEffort(systemLogger, "error", "login", loginError)
-        error(loginError, 0)
-    end
+        if authenticatedUser == nil then
+            logBestEffort(bootLogger, "error", "login", loginError)
+            logBestEffort(systemLogger, "error", "login", loginError)
+            error(loginError, 0)
+        end
 
-    -- login owns and clears its credential screen. Reset normal terminal state
-    -- after it returns, then run the noncritical presentation. A broken
-    -- dickfetch still receives the existing minimal fallback before the
-    -- authenticated shell starts.
-    prepareTerminal()
-    logBestEffort(bootLogger, "info", "init", "dickfetch starting")
-    local presentationSucceeded, presentationError =
-        runDickfetch(dickfetchContext)
+        -- login owns and clears its credential screen. Reset normal terminal
+        -- state after it returns, then run the noncritical presentation. A
+        -- broken dickfetch still receives the existing minimal fallback before
+        -- the authenticated shell starts.
+        prepareTerminal()
+        logBestEffort(bootLogger, "info", "init", "dickfetch starting")
+        local presentationSucceeded, presentationError =
+            runDickfetch(dickfetchContext)
 
-    if not presentationSucceeded then
+        if not presentationSucceeded then
+            logBestEffort(
+                bootLogger,
+                "warn",
+                "dickfetch",
+                "Presentation failure: " .. tostring(presentationError)
+            )
+            drawDickfetchFallback(dickfetchContext, presentationError)
+        end
+
+        local shellContext = {
+            runtimeApiVersion = runtimeContext.apiVersion,
+            bootID = bootID,
+            version = version,
+            hostname = hostname,
+            machineID = machineID,
+            user = authenticatedUser.name,
+            uid = authenticatedUser.uid,
+            home = authenticatedUser.home,
+            isAdmin = authenticatedUser.admin,
+            shellHistoryLimit = shellHistoryLimit,
+        }
+
+        authenticatedUser = nil
         logBestEffort(
             bootLogger,
-            "warn",
-            "dickfetch",
-            "Presentation failure: " .. tostring(presentationError)
+            "info",
+            "init",
+            "Authenticated shell starting"
         )
-        drawDickfetchFallback(dickfetchContext, presentationError)
+        local shellResult, shellFailure = runShell(shellContext)
+
+        if shellResult ~= "logout" then
+            logBestEffort(bootLogger, "error", "shell", shellFailure)
+            logBestEffort(systemLogger, "error", "shell", shellFailure)
+            error(shellFailure, 0)
+        end
+
+        logBestEffort(
+            systemLogger,
+            "info",
+            "shell",
+            "Authenticated session logged out"
+        )
+        logBestEffort(
+            authLogger,
+            "info",
+            "logout",
+            "Logout for " .. shellContext.user ..
+                " uid=" .. tostring(shellContext.uid)
+        )
     end
-
-    local shellContext = {
-        runtimeApiVersion = runtimeContext.apiVersion,
-        bootID = bootID,
-        version = version,
-        hostname = hostname,
-        machineID = machineID,
-        user = authenticatedUser.name,
-        uid = authenticatedUser.uid,
-        home = authenticatedUser.home,
-        isAdmin = authenticatedUser.admin,
-        shellHistoryLimit = shellHistoryLimit,
-    }
-
-    authenticatedUser = nil
-    logBestEffort(bootLogger, "info", "init", "Authenticated shell starting")
-    local shellResult, shellFailure = runShell(shellContext)
-
-    if shellResult ~= "logout" then
-        logBestEffort(bootLogger, "error", "shell", shellFailure)
-        logBestEffort(systemLogger, "error", "shell", shellFailure)
-        error(shellFailure, 0)
-    end
-
-    logBestEffort(
-        systemLogger,
-        "info",
-        "shell",
-        "Authenticated session logged out"
-    )
-    logBestEffort(
-        authLogger,
-        "info",
-        "logout",
-        "Logout for " .. shellContext.user ..
-            " uid=" .. tostring(shellContext.uid)
-    )
 end
+
+return runWithHardwareWatcher(runSessionLifecycle, hardwareModule)

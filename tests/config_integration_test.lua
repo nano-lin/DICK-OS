@@ -12,6 +12,7 @@ local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
 local INSTALLED_SHELL_PATH = "/dickos/system/shell.lua"
 local AUTH_PATH = "/dickos/lib/auth.lua"
 local LOGIN_PATH = "/dickos/system/login.lua"
+local HARDWARE_PATH = "/dickos/lib/hardware.lua"
 
 local SHELL_TEST_STOP = "__DICK_CONFIG_INTEGRATION_SHELL_REACHED__"
 local INPUT_TEST_STOP = "__DICK_CONFIG_INTEGRATION_INPUT_STOP__"
@@ -95,6 +96,9 @@ local function runInitScenario(options)
         dickfetchCount = 0,
         lifecycle = {},
         timerCount = 0,
+        hardwareScanCount = 0,
+        watcherStarts = 0,
+        parallelCalls = 0,
     }
     local metadata = {
         ["/dickos/etc/version"] = "0.1.0-unstable",
@@ -126,6 +130,30 @@ local function runInitScenario(options)
             return "timer", state.timerCount
         end,
     }
+
+    -- This intentionally small scheduler mock exercises init's ownership
+    -- boundary, not CC:T's scheduler implementation. The watcher is started
+    -- once and suspended, then the complete login/logout lifecycle runs as the
+    -- other task. Dedicated hardware runtime tests cover event dispatch.
+    if options.hardwareAvailable then
+        environment.parallel = {
+            waitForAny = function(sessionTask, watcherTask)
+                state.parallelCalls = state.parallelCalls + 1
+
+                local watcherCoroutine = coroutine.create(watcherTask)
+                local watcherStarted, marker = coroutine.resume(
+                    watcherCoroutine
+                )
+
+                assert(watcherStarted, tostring(marker))
+                assert(marker == "hardware-watcher-ready")
+                assert(coroutine.status(watcherCoroutine) == "suspended")
+
+                sessionTask()
+                return 1
+            end,
+        }
+    end
 
     environment.fs = {
         exists = function(path)
@@ -236,6 +264,47 @@ local function runInitScenario(options)
             end
         end
 
+        if path == HARDWARE_PATH then
+            if not options.hardwareAvailable then
+                return nil, "simulated missing hardware.lua"
+            end
+
+            if options.invalidHardwareAPI then
+                return function() return {} end
+            end
+
+            return function()
+                return {
+                    scan = function()
+                        state.hardwareScanCount =
+                            state.hardwareScanCount + 1
+
+                        if options.hardwareScanFailure then
+                            error("simulated hardware scan failure", 0)
+                        end
+
+                        return options.hardwareDescriptors or {},
+                            options.hardwareWarnings or {}, nil
+                    end,
+                    watch = function(callback)
+                        state.watcherStarts = state.watcherStarts + 1
+                        callback({
+                            level = "info",
+                            message = "Peripheral attached: left " ..
+                                "type=modem state=wireless " ..
+                                "support=supported",
+                        }, {}, nil)
+                        callback({
+                            level = "info",
+                            message = "Peripheral detached: left",
+                        }, {}, nil)
+                        coroutine.yield("hardware-watcher-ready")
+                        error("hardware watcher resumed after session", 0)
+                    end,
+                }
+            end
+        end
+
         if path == INSTALLED_SHELL_PATH then
             return function(context)
                 state.lifecycle[#state.lifecycle + 1] = "shell"
@@ -266,7 +335,9 @@ local function runInitScenario(options)
     return state, succeeded, failure
 end
 
-local delayedState, delayedSucceeded, delayedFailure = runInitScenario({})
+local delayedState, delayedSucceeded, delayedFailure = runInitScenario({
+    hardwareAvailable = true,
+})
 assert(not delayedSucceeded)
 assert(contains(delayedFailure, SHELL_TEST_STOP))
 assert(delayedState.shellContext ~= nil)
@@ -284,6 +355,12 @@ assert(table.concat(delayedState.lifecycle, ",") ==
     "login,dickfetch,shell")
 assert(hasLog(delayedState, "info", "Configuration library loaded"))
 assert(hasLog(delayedState, "info", "System configuration loaded"))
+assert(hasLog(delayedState, "info", "Initial hardware discovery completed: 0"))
+assert(delayedState.hardwareScanCount == 1)
+assert(delayedState.watcherStarts == 1)
+assert(delayedState.parallelCalls == 1)
+assert(hasLog(delayedState, "info", "Peripheral attached: left"))
+assert(hasLog(delayedState, "info", "Peripheral detached: left"))
 
 local immediateState, immediateSucceeded, immediateFailure = runInitScenario({
     configText = table.concat({
@@ -376,6 +453,7 @@ assert(hasLog(brokenDickfetchState, "warn", "Presentation failure"))
 
 local logoutState, logoutSucceeded, logoutFailure = runInitScenario({
     logoutOnce = true,
+    hardwareAvailable = true,
     configText = table.concat({
         "format_version = 1",
         "boot.cosmetic_delay = false",
@@ -394,6 +472,31 @@ assert(logoutState.shellContexts[1].bootID == "B-1234ABCD")
 assert(logoutState.shellContexts[2].bootID == "B-1234ABCD")
 assert(logoutState.shellContexts[1].uid == 1000)
 assert(logoutState.shellContexts[1].isAdmin == true)
+assert(logoutState.hardwareScanCount == 1)
+assert(logoutState.watcherStarts == 1)
+assert(logoutState.parallelCalls == 1)
+
+local unavailableHardwareState, unavailableHardwareSucceeded,
+    unavailableHardwareFailure = runInitScenario({})
+assert(not unavailableHardwareSucceeded)
+assert(contains(unavailableHardwareFailure, SHELL_TEST_STOP))
+assert(unavailableHardwareState.shellContext ~= nil)
+assert(hasLog(
+    unavailableHardwareState,
+    "error",
+    "Hardware discovery unavailable"
+))
+
+local failedHardwareState, failedHardwareSucceeded, failedHardwareFailure =
+    runInitScenario({
+        hardwareAvailable = true,
+        hardwareScanFailure = true,
+    })
+assert(not failedHardwareSucceeded)
+assert(contains(failedHardwareFailure, SHELL_TEST_STOP))
+assert(failedHardwareState.shellContext ~= nil)
+assert(hasLog(failedHardwareState, "error", "hardware scan failure"))
+assert(failedHardwareState.watcherStarts == 1)
 
 local invalidReturnState, invalidReturnSucceeded, invalidReturnFailure =
     runInitScenario({ invalidShellReturn = true })

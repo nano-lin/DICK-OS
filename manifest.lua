@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-sudo-fs-coreutils-foundation",
+    payloadID = "dickos-0.1.0-unstable-hardware-foundation",
 
     files = {
         {
@@ -54,6 +54,10 @@ return {
         {
             source = "src/dickos/lib/editor_buffer.lua",
             target = "/dickos/lib/editor_buffer.lua",
+        },
+        {
+            source = "src/dickos/lib/hardware.lua",
+            target = "/dickos/lib/hardware.lua",
         },
         {
             source = "src/dickos/etc/system.cfg",
@@ -110,6 +114,10 @@ return {
         {
             source = "src/dickos/bin/status.lua",
             target = "/dickos/bin/status.lua",
+        },
+        {
+            source = "src/dickos/bin/peripherals.lua",
+            target = "/dickos/bin/peripherals.lua",
         },
         {
             source = "src/dickos/bin/whoami.lua",

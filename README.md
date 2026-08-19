@@ -53,6 +53,10 @@ persisted only as a salted PBKDF2-HMAC-SHA256 verifier in machine-specific
 Early development. The current unstable foundation includes native owner login,
 `whoami`, `id`, `passwd`, logout-to-login, session-scoped `sudo`, a shared
 filesystem mutation guard, and safe `touch`/`mkdir`/`cp`/`mv`/`rm` commands.
+It also includes live peripheral discovery, the read-only `peripherals`
+command, and an init-owned CC:T attach/detach watcher. Standard modem, monitor,
+speaker, printer, and drive types are classified as supported; other addon
+types remain visible as unsupported.
 This is an OS policy for official DICK commands, not a CC:T sandbox or Unix
 ACL model: arbitrary Lua, CraftOS, and Recovery can still call `fs` directly.
 Additional user-management commands are not implemented yet. Expect breaking

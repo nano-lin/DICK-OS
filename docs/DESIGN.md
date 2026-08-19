@@ -648,6 +648,7 @@ Target installed layout:
     │   ├── cp.lua
     │   ├── mv.lua
     │   ├── rm.lua
+    │   ├── peripherals.lua
     │   ├── uname.lua
     │   └── uptime.lua
     ├── services/
@@ -839,9 +840,11 @@ init.lua a giant file.
 The current implemented handoff is:
 
 ```text
-init -> persistent system configuration -> authentication core/users.db
-     -> boot presentation -> login -> successful authentication
-     -> dickfetch -> authenticated /dickos/system/shell.lua
+init -> persistent system configuration -> initial hardware discovery
+     -> authentication core/users.db -> boot presentation
+     -> one hardware watcher + login/session lifecycle
+     -> login -> successful authentication -> dickfetch
+     -> authenticated /dickos/system/shell.lua
 ```
 
 Init combines Stage-0's runtime API version and Boot ID with the installed
@@ -852,14 +855,23 @@ authenticated identity and validated `shell.history_limit` join the shell
 session table; parsed configuration, users.db, verifiers, passwords, and auth
 modules are not forwarded. Boot ID is never written to disk.
 
+Hardware discovery is deliberately noncritical. Init performs one live scan
+before authentication validation and records the result, but zero devices,
+unsupported devices, individual query failures, and even an unavailable
+hardware library do not replace the authentication boundary or force
+Recovery. No synthetic hardware row was added to the boot TUI: discovery is
+real work recorded in logs, while the visible stage list remains unchanged.
+
 Init owns the session loop. The shell may return only `logout`; init records
 that transition best-effort and starts login again with the same Boot ID. Each
 successful login clears/prepares the normal terminal, runs dickfetch, and then
 starts a new authenticated shell. No dickfetch presentation is shown before
 credentials are accepted. A missing/broken auth dependency, invalid users.db,
 missing/crashing login, or missing/crashing/unexpectedly returning shell is an
-init failure and reaches Stage-0 Recovery. This core contract remains separate
-from optional config-data fallback and the shell's protected child-command
+init failure and reaches Stage-0 Recovery. One init-owned hardware watcher runs
+beside the complete login/logout lifecycle and therefore remains the same
+watcher across sessions. This core contract remains separate from optional
+config-data and hardware fallback and the shell's protected child-command
 boundary.
 
 ---
@@ -1311,7 +1323,7 @@ The current external `/dickos/bin` commands are:
 - `hostname`, `uname`, `uptime`, `df`, `status`;
 - `whoami`, `id`, `passwd`;
 - `reboot`, `shutdown`;
-- `dickfetch`, `dicklog`.
+- `dickfetch`, `dicklog`, `peripherals`.
 
 `/dickos/lib/fs_guard.lua` is the shared mutation-policy helper. It performs
 lexical absolute normalisation, DICK cwd/home resolution, boundary-aware
@@ -1384,10 +1396,6 @@ critical editing confirms exactly once before loading the document, and all
 saves in that editor invocation share that approval.
 
 The following planned 0.1.0 commands are not implemented by this milestone.
-
-System:
-
-- peripherals
 
 Services:
 
@@ -1596,10 +1604,11 @@ remain the shell's best-effort child failure/termination records.
 DICK EDIT v1's native foundation has been manually runtime-verified in
 Minecraft with CC:T.
 
-The filesystem-guard/elevated-editor integration added by the current
-milestone has host-side coverage but has not yet been runtime-verified in
-Minecraft. The items below describe the previously verified native editor
-foundation; protected/critical edit behavior requires the new runtime plan.
+The privilege/coreutils milestone, including filesystem-guard and elevated
+editor integration, has now been manually runtime-verified in Minecraft. This
+records milestone-level completion only; it does not infer unreported results
+for individual cases. The items below remain the previously documented native
+editor checks.
 
 The previously confirmed paths include:
 
@@ -1665,47 +1674,89 @@ with diagnostics and actions.
 
 # 28. Hardware discovery
 
-DICK/OS must dynamically discover peripherals.
+DICK/OS dynamically discovers peripherals through the public CC:T
+`peripheral.getNames()` API. `/dickos/lib/hardware.lua` owns enumeration, type
+normalisation, support/state classification, deterministic ordering, and
+hotplug descriptions. Returned names are opaque: `left`, `monitor_0`, or a
+generated wired-network name all follow the same path, with no six-side
+filtering or side-to-type assumptions.
 
-Never assume:
+The public serializable descriptor contract is version 1:
 
-left = modem
-right = speaker
+```lua
+{
+    descriptorVersion = 1,
+    name = "left",
+    types = { "modem" },
+    primaryType = "modem",
+    state = "wireless",
+    support = "supported",
+}
+```
 
-Hardware may be attached to arbitrary sides or through wired peripheral
-networks.
+`types` retains every string capability returned by CC:T, sorted and
+de-duplicated for stable diagnostics; `primaryType` retains the first usable
+reported capability for display. Descriptors contain data only, never wrapped
+peripherals or raw method tables. Multiple same-type devices remain separate
+descriptors, and complete scans are sorted by device name.
 
-The system should track:
+The v1 supported type set is deliberately explicit: modem, monitor, speaker,
+printer, and drive. An attached recognized non-modem is `online`; a modem uses
+its public `isWireless` method to report `wireless` or `wired`. Unknown addon
+types remain visible as `online` and `unsupported`. A failed type or modem
+query degrades that one descriptor to safe `unknown` fields and emits a
+warning without hiding healthy devices. External `peripheral` calls are
+isolated at their individual boundaries rather than wrapping unrelated OS
+logic in a broad error handler.
 
-- device name
-- device type
-- current availability
-- known driver/support status
+Init performs one real scan before normal authentication/session runtime and
+logs the descriptor count plus warnings. No attached peripherals is a valid
+zero result. A missing, invalid, or crashing hardware library is reported as
+hardware discovery unavailable and boot continues to login/shell when the
+critical authentication path is otherwise healthy. Hardware discovery does
+not require a modem or any other optional peripheral and has no speculative
+configuration.
 
-Example:
-
-DEVICE       TYPE        STATE
-
-left         modem       wireless
-top          monitor     online
-right        speaker     online
-
-Unknown addon hardware should be represented safely, for example:
-
-gpu_0        directgpu   unsupported
-
-and boot should continue.
+The read-only native `peripherals` command rescans live state on every
+invocation and prints DEVICE, TYPE, STATE, and SUPPORT. It requires normal DICK
+command context but never sudo. Columns are clipped on the standard colour
+terminal, with a compact multi-line fallback at narrow widths, so long
+wired/addon names cannot destroy the output. `peripherals --help` is discovered
+through the shell's existing external-command help mechanism. A successful
+empty scan prints `No peripherals detected.`; a broken library or scan is
+reported distinctly as `Hardware discovery unavailable.`
 
 ---
 
 # 29. Peripheral hotplug
 
-DICK/OS should react to peripherals being attached or detached while running.
+DICK/OS reacts to the public CC:T `peripheral` and `peripheral_detach` events
+without polling. Init owns one small watcher beside the complete login/logout
+session lifecycle using `parallel.waitForAny`; it is not started per shell, so
+logout followed by login retains one watcher and the same Boot ID. CC:T's
+parallel event model supplies each cooperating coroutine its own event view,
+allowing login, shell `read()`, sudo, passwd, and DICK EDIT to keep their normal
+keyboard, mouse, timer, and terminate handling.
 
-A full reboot should not normally be required simply because a monitor,
-speaker or modem changed.
+The watcher uses `os.pullEventRaw()` only inside its own coroutine. It ignores
+`terminate`, so Ctrl+T does not shut down the watcher or convert the existing
+shell/editor/sudo/login containment policies into Recovery. Child programs are
+unchanged and are not switched to raw event handling.
 
-Hardware state should be refreshed accordingly.
+Attach events query and log the new live descriptor. Detach events log at
+least the opaque name without requiring a query after the device has already
+disappeared. Unsupported attachment or query degradation is warning-level;
+normal attach/detach is informational. Records use the existing `system.log`
+with component `hardware`, and callback/log failures are isolated. If the
+watcher itself fails, init logs an error and keeps an inert event coroutine
+alive so the authenticated session remains the task which controls runtime
+completion; there is intentionally no restart supervisor yet.
+
+No hardware inventory is persisted. The next `peripherals` command and every
+new boot enumerate the current topology, so local moves and wired-network
+changes need no reboot. This foundation does not implement dickd, a driver
+framework, addon drivers, aliases, a primary monitor/modem, speaker groups, or
+automatic application binding.
 
 ---
 
@@ -2076,6 +2127,7 @@ Ctrl+T init restarts and Recovery retries under the same Stage-0 execution. A
 new Stage-0 execution appends a new marker and normally has a new Boot ID.
 `system.log` begins the longer-lived system/session diagnostic stream. Init
 records configuration-library loading, system-config loading/default fallback,
+initial hardware discovery, hardware attach/detach and degraded-query events,
 authentication-state readiness, and authenticated session transitions.
 Configuration WARN records describe paths,
 keys, and diagnostics but never contain the complete file contents. The shell
