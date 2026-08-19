@@ -842,7 +842,7 @@ The current implemented handoff is:
 ```text
 init -> persistent system configuration -> initial hardware discovery
      -> authentication core/users.db -> boot presentation
-     -> one hardware watcher + login/session lifecycle
+     -> login/session lifecycle + one hardware watcher + one dickd
      -> login -> successful authentication -> dickfetch
      -> authenticated /dickos/system/shell.lua
 ```
@@ -870,9 +870,11 @@ credentials are accepted. A missing/broken auth dependency, invalid users.db,
 missing/crashing login, or missing/crashing/unexpectedly returning shell is an
 init failure and reaches Stage-0 Recovery. One init-owned hardware watcher runs
 beside the complete login/logout lifecycle and therefore remains the same
-watcher across sessions. This core contract remains separate from optional
-config-data and hardware fallback and the shell's protected child-command
-boundary.
+watcher across sessions. One independently noncritical dickd task also spans
+all sessions and receives only runtime/machine identity, never authenticated
+user or shell state. A missing/crashing dickd leaves the session and hardware
+task alive. This core contract remains separate from optional config-data,
+hardware/service fallback, and the shell's protected child-command boundary.
 
 ---
 
@@ -912,8 +914,10 @@ Activity: Machine identity
 A stage is represented by a small record containing a label and visual state.
 This leaves an obvious place to add future real init work without introducing a
 generic boot framework. User database/auth core now describes real validation;
-integrity, services, drivers, dickd, DickNet, and package management must not
-appear as successful stages until those subsystems exist.
+integrity, drivers, DickNet, and package management must not appear as
+successful stages until those subsystems exist. dickd now runs after this
+presentation as a noncritical sibling task; no synthetic boot-progress row was
+added for it.
 
 After progress completes, init clears the framed boot screen and starts the
 native login UI. Only after successful authentication does init clear/prepare
@@ -1039,11 +1043,15 @@ from 0 through 256: zero disables the in-memory session history, while a
 positive value retains only that many newest non-blank commands. History is
 neither persisted nor logged.
 
-`network.cfg` and `services.cfg` currently contain only `format_version = 1`
-plus explanatory comments. They reserve real versioned files for future
-DickNet and dickd schemas without enabling a network subsystem, fake services,
-or autostart. `users.db` also uses config-v1 syntax, but users.lua owns its
-strict security semantics and never falls back to defaults or auto-recreation.
+`network.cfg` currently contains only `format_version = 1` plus explanatory
+comments and does not enable DickNet. `services.cfg` also ships with no service
+entries because no production service exists yet, but dickd now recognises the
+dynamic boolean policy `service.<valid_name>.autostart = true|false`. It parses
+that file through config v1 and then validates the dynamic namespace itself.
+A missing, malformed, or unsupported services file selects no autostarts and
+logs a warning without causing Recovery; manual service control remains
+available. `users.db` also uses config-v1 syntax, but users.lua owns its strict
+security semantics and never falls back to defaults or auto-recreation.
 
 `serialize` emits deterministic canonical syntax with `format_version` first
 and remaining keys sorted. Programmatic writing preserves scalar values but may
@@ -1395,12 +1403,11 @@ an ordinary protected target is rejected before the UI starts; elevated
 critical editing confirms exactly once before loading the document, and all
 saves in that editor invocation share that approval.
 
+The implemented service foundation adds read-only `services` and
+`service status <name>`, plus elevated `service start|stop|restart <name>`.
+Their detailed runtime and privilege contracts are in section 30.
+
 The following planned 0.1.0 commands are not implemented by this milestone.
-
-Services:
-
-- services
-- service
 
 Networking:
 
@@ -1754,52 +1761,135 @@ completion; there is intentionally no restart supervisor yet.
 
 No hardware inventory is persisted. The next `peripherals` command and every
 new boot enumerate the current topology, so local moves and wired-network
-changes need no reboot. This foundation does not implement dickd, a driver
-framework, addon drivers, aliases, a primary monitor/modem, speaker groups, or
-automatic application binding.
+changes need no reboot. This foundation does not implement a driver framework,
+addon drivers, aliases, a primary monitor/modem, speaker groups, or automatic
+application binding. The hardware watcher remains independent from dickd; the
+two are sibling init runtime tasks and services do not own hotplug discovery.
+
+The hardware discovery, `peripherals`, hotplug, Ctrl+T containment, and
+noncritical-failure foundation has been manually runtime-verified in Minecraft
+with CC:T. That completed hardware verification does not imply runtime success
+for the later dickd milestone documented below.
 
 ---
 
 # 30. Service manager
 
-Working name:
+The implemented `/dickos/system/dickd.lua` is one small machine-service
+supervisor, not another shell or init. Init continues to own boot,
+authentication readiness, the login/session loop, and hardware runtime. One
+dickd task runs beside one hardware watcher and the complete session lifecycle;
+logout/login does not recreate either background task. A missing, invalid, or
+crashing dickd is logged as noncritical, leaves login/shell and hardware alive,
+and makes service commands time out cleanly instead of causing Recovery. Init
+does not automatically restart a failed supervisor.
 
-`dickd`
+Service IDs match `^[a-z][a-z0-9_]*$` and map only to
+`/dickos/services/<name>.lua`. Discovery rescans that directory for `services`
+and start requests, ignores directories, junk, invalid names, and non-Lua
+files, and treats a missing directory as a healthy empty set. No paths supplied
+by a user are executed and no services database is persisted. The production
+manifest currently ships no service program; temporary fixtures belong only in
+tests. The next DickNet milestone is expected to add the first real service.
 
-The goal is a small service supervisor.
+Service module API v1 is:
 
-Do not recreate all of systemd.
+```lua
+return {
+    run = function(context)
+        -- Long-running cooperative service.
+    end,
+    stop = function(context)
+        -- Optional short, non-yielding cleanup.
+    end,
+}
+```
 
-Required operations:
+`run` is mandatory and `stop` is optional. Each start recompiles and executes
+the source and creates a fresh coroutine; restart therefore loads edited code
+instead of retaining a module instance. The service receives only data:
 
-services
+```lua
+{
+    serviceApiVersion = 1,
+    name = "dicknet",
+    runtimeApiVersion = 1,
+    bootID = "B-XXXXXXXX",
+    version = "0.1.0-unstable",
+    hostname = "core-01",
+    machineID = "DCK-C-...",
+}
+```
 
-service status <name>
-service start <name>
-service stop <name>
-service restart <name>
+No login identity, password/verifier, auth module, sudo cache, cwd, history, or
+mutable supervisor record crosses this boundary. Services are nevertheless
+trusted DICK/OS machine components with ordinary public CC:T APIs such as
+`os`, `fs`, `peripheral`, `redstone`, and `textutils`. Their dedicated Lua
+environment inherits those globals, sets `_G` to itself, and blocks direct
+`print`, `write`, `read`, and `term` access so a daemon cannot accidentally
+draw over login, shell, or editor. This is runtime hygiene, not a capability or
+kernel sandbox; trusted arbitrary Lua can deliberately escape policy through
+the platform APIs available to it.
 
-Conceptual states:
+The exact state vocabulary is `STOPPED`, `STARTING`, `RUNNING`, and `FAILED`.
+A discovered/manual-stopped service is STOPPED. Start sets STARTING, loads and
+validates the module, creates its coroutine, and resumes `run(context)` once.
+The first valid yield makes it RUNNING. A compile/factory/API/runtime failure,
+an invalid yielded filter, or an unexpected return makes only that service
+FAILED with a short stable classification. Failure logs never include raw
+event/modem payloads or arbitrary service stack traces.
 
-STOPPED
-STARTING
-RUNNING
-FAILED
+dickd is one cooperative event dispatcher. It records the `nil` or string
+filter yielded through normal CC:T operations such as `os.pullEvent`,
+`os.pullEventRaw`, and `sleep`. Nil receives every ordinary event; a string
+receives only the matching name. After each resume the next filter is recorded;
+an error/return transitions that service to FAILED while other services keep
+running. `dickd_request`, `dickd_response`, and `terminate` are never delivered
+to services. The outer supervisor uses `os.pullEventRaw`, so interactive Ctrl+T
+still reaches the session task's independent event copy but cannot terminate
+daemons. Cooperative services must yield; there is no preemption, and a
+busy-looping trusted service remains subject to CC:T's watchdog.
 
-Services may eventually define restart policies.
+Stop invokes the optional cleanup hook once in a separate coroutine and resumes
+it only once. A hook error or forbidden yield is warned about but cannot suspend
+the supervisor: the run coroutine/module/context is discarded and state becomes
+STOPPED. Restart applies the same disposal to RUNNING/STARTING/FAILED instances,
+then reloads and starts a fresh source. If source disappeared, no old coroutine
+survives and the start reports a controlled source failure.
 
-Example:
+The shared `/dickos/lib/service_client.lua` implements local event IPC using
+correlated `dickd_request`/`dickd_response` tables and a one-second timer. It
+accepts only the matching request ID, uses no files/global manager/rednet/modem,
+and preserves ordinary child-command Ctrl+T through `os.pullEvent`. Read-only
+`services` and `service status <name>` work in a normal session. Start, stop,
+and restart require the exact sudo-created effective tuple
+`isElevated=true`, `effectiveUID=0`, `effectiveUser="root"`; both the command
+and dickd validate it. This prevents accidental official-command mutation, but
+unrestricted Lua can forge a local event because DICK/OS is not a kernel
+sandbox. No cryptographic IPC authentication is claimed.
 
-dicknet crashes
-    |
-    v
-dickd notices failure
-    |
-    v
-failure logged
-    |
-    v
-restart according to policy
+`services` prints the sorted compact SERVICE/STATE/AUTOSTART inventory without
+long failure details and explicitly reports an empty installation. `service
+status` shows Service, State, Autostart, and a safe failure classification when
+applicable. The only mutating forms are `sudo service start`, `stop`, and
+`restart`; v1 has no arbitrary run/exec, enable/disable, install, edit, logs, or
+argument-forwarding operation.
+
+Autostart policy uses config v1 keys
+`service.<valid_name>.autostart = true|false`. At supervisor startup services
+are discovered, the dynamic config is parsed/validated, and every true entry is
+started independently. A malformed/missing/unsupported file selects zero
+autostarts with a warning; a wrong-type dynamic entry is ignored independently
+where parsing succeeds. One failed autostart becomes FAILED without blocking
+healthy neighbours or login.
+
+Lifecycle/config diagnostics use existing `system.log` with component `dickd`.
+There is no `service.log` and ordinary delivered events/timer ticks are not
+logged. Automatic restart, backoff/rate limiting, dependency ordering,
+targets/runlevels, process IDs/signals, user services, and remote management are
+explicitly deferred. Failed services remain FAILED until an administrator
+manually restarts them. DickNet, including any future restart policy, is a
+separate next milestone and is not implemented here.
 
 ---
 
@@ -2128,8 +2218,10 @@ new Stage-0 execution appends a new marker and normally has a new Boot ID.
 `system.log` begins the longer-lived system/session diagnostic stream. Init
 records configuration-library loading, system-config loading/default fallback,
 initial hardware discovery, hardware attach/detach and degraded-query events,
-authentication-state readiness, and authenticated session transitions.
-Configuration WARN records describe paths,
+authentication-state readiness, and authenticated session transitions. dickd
+records supervisor readiness plus service starting, running, stopped, restart,
+autostart, and safely classified failure transitions; it does not log each
+delivered event or timer tick. Configuration WARN records describe paths,
 keys, and diagnostics but never contain the complete file contents. The shell
 records startup, missing commands, ordinary command termination, and child
 load/runtime failures. Shell records include the resolved command name but

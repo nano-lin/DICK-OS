@@ -56,7 +56,10 @@ filesystem mutation guard, and safe `touch`/`mkdir`/`cp`/`mv`/`rm` commands.
 It also includes live peripheral discovery, the read-only `peripherals`
 command, and an init-owned CC:T attach/detach watcher. Standard modem, monitor,
 speaker, printer, and drive types are classified as supported; other addon
-types remain visible as unsupported.
+types remain visible as unsupported. The current service foundation adds one
+noncritical `dickd` task, cooperative service discovery/scheduling, config-v1
+autostart policy, read-only `services`/`service status`, and sudo-protected
+start/stop/restart. No production service or DickNet daemon ships yet.
 This is an OS policy for official DICK commands, not a CC:T sandbox or Unix
 ACL model: arbitrary Lua, CraftOS, and Recovery can still call `fs` directly.
 Additional user-management commands are not implemented yet. Expect breaking

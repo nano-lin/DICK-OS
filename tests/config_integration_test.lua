@@ -13,6 +13,7 @@ local INSTALLED_SHELL_PATH = "/dickos/system/shell.lua"
 local AUTH_PATH = "/dickos/lib/auth.lua"
 local LOGIN_PATH = "/dickos/system/login.lua"
 local HARDWARE_PATH = "/dickos/lib/hardware.lua"
+local DICKD_PATH = "/dickos/system/dickd.lua"
 
 local SHELL_TEST_STOP = "__DICK_CONFIG_INTEGRATION_SHELL_REACHED__"
 local INPUT_TEST_STOP = "__DICK_CONFIG_INTEGRATION_INPUT_STOP__"
@@ -98,7 +99,10 @@ local function runInitScenario(options)
         timerCount = 0,
         hardwareScanCount = 0,
         watcherStarts = 0,
+        dickdStarts = 0,
+        dickdContexts = {},
         parallelCalls = 0,
+        inBackgroundTask = false,
     }
     local metadata = {
         ["/dickos/etc/version"] = "0.1.0-unstable",
@@ -127,29 +131,42 @@ local function runInitScenario(options)
             return state.timerCount
         end,
         pullEventRaw = function()
+            if state.inBackgroundTask then
+                return coroutine.yield("degraded-runtime-ready")
+            end
+
             return "timer", state.timerCount
         end,
     }
 
+    local dickdAvailable = options.dickdAvailable ~= false
+
     -- This intentionally small scheduler mock exercises init's ownership
-    -- boundary, not CC:T's scheduler implementation. The watcher is started
-    -- once and suspended, then the complete login/logout lifecycle runs as the
-    -- other task. Dedicated hardware runtime tests cover event dispatch.
-    if options.hardwareAvailable then
+    -- boundary, not CC:T's scheduler implementation. Every background sibling
+    -- is started once and suspended, then the complete login/logout lifecycle
+    -- runs as task one. Dedicated hardware/dickd tests cover event dispatch.
+    if options.hardwareAvailable or dickdAvailable then
         environment.parallel = {
-            waitForAny = function(sessionTask, watcherTask)
+            waitForAny = function(...)
                 state.parallelCalls = state.parallelCalls + 1
+                local tasks = { ... }
 
-                local watcherCoroutine = coroutine.create(watcherTask)
-                local watcherStarted, marker = coroutine.resume(
-                    watcherCoroutine
-                )
+                for index = 2, #tasks do
+                    local backgroundCoroutine = coroutine.create(tasks[index])
+                    state.inBackgroundTask = true
+                    local backgroundStarted, marker = coroutine.resume(
+                        backgroundCoroutine
+                    )
+                    state.inBackgroundTask = false
 
-                assert(watcherStarted, tostring(marker))
-                assert(marker == "hardware-watcher-ready")
-                assert(coroutine.status(watcherCoroutine) == "suspended")
+                    assert(backgroundStarted, tostring(marker))
+                    assert(marker == "hardware-watcher-ready" or
+                        marker == "dickd-ready" or
+                        marker == "degraded-runtime-ready")
+                    assert(coroutine.status(backgroundCoroutine) == "suspended")
+                end
 
-                sessionTask()
+                tasks[1]()
                 return 1
             end,
         }
@@ -305,6 +322,42 @@ local function runInitScenario(options)
             end
         end
 
+        if path == DICKD_PATH then
+            if not dickdAvailable then
+                return nil, "simulated missing dickd.lua"
+            end
+
+            if options.invalidDICKDAPI then
+                return function() return {} end
+            end
+
+            if options.throwingDICKDAPI then
+                return function()
+                    return setmetatable({}, {
+                        __index = function()
+                            error("simulated throwing dickd API", 0)
+                        end,
+                    })
+                end
+            end
+
+            return function()
+                return {
+                    run = function(context)
+                        state.dickdStarts = state.dickdStarts + 1
+                        state.dickdContexts[#state.dickdContexts + 1] = context
+
+                        if options.dickdRuntimeFailure then
+                            error("simulated dickd runtime failure", 0)
+                        end
+
+                        coroutine.yield("dickd-ready")
+                        error("dickd resumed after session", 0)
+                    end,
+                }
+            end
+        end
+
         if path == INSTALLED_SHELL_PATH then
             return function(context)
                 state.lifecycle[#state.lifecycle + 1] = "shell"
@@ -358,7 +411,18 @@ assert(hasLog(delayedState, "info", "System configuration loaded"))
 assert(hasLog(delayedState, "info", "Initial hardware discovery completed: 0"))
 assert(delayedState.hardwareScanCount == 1)
 assert(delayedState.watcherStarts == 1)
+assert(delayedState.dickdStarts == 1)
 assert(delayedState.parallelCalls == 1)
+assert(#delayedState.dickdContexts == 1)
+assert(delayedState.dickdContexts[1].runtimeApiVersion == 1)
+assert(delayedState.dickdContexts[1].bootID == "B-1234ABCD")
+assert(delayedState.dickdContexts[1].version == "0.1.0-unstable")
+assert(delayedState.dickdContexts[1].hostname == "test-01")
+assert(delayedState.dickdContexts[1].machineID == "DCK-C-11-A91F")
+assert(delayedState.dickdContexts[1].user == nil)
+assert(delayedState.dickdContexts[1].uid == nil)
+assert(delayedState.dickdContexts[1].isAdmin == nil)
+assert(delayedState.dickdContexts[1].cwd == nil)
 assert(hasLog(delayedState, "info", "Peripheral attached: left"))
 assert(hasLog(delayedState, "info", "Peripheral detached: left"))
 
@@ -474,6 +538,7 @@ assert(logoutState.shellContexts[1].uid == 1000)
 assert(logoutState.shellContexts[1].isAdmin == true)
 assert(logoutState.hardwareScanCount == 1)
 assert(logoutState.watcherStarts == 1)
+assert(logoutState.dickdStarts == 1)
 assert(logoutState.parallelCalls == 1)
 
 local unavailableHardwareState, unavailableHardwareSucceeded,
@@ -497,6 +562,39 @@ assert(contains(failedHardwareFailure, SHELL_TEST_STOP))
 assert(failedHardwareState.shellContext ~= nil)
 assert(hasLog(failedHardwareState, "error", "hardware scan failure"))
 assert(failedHardwareState.watcherStarts == 1)
+
+local unavailableDICKDState, unavailableDICKDSucceeded,
+    unavailableDICKDFailure = runInitScenario({ dickdAvailable = false })
+assert(not unavailableDICKDSucceeded)
+assert(contains(unavailableDICKDFailure, SHELL_TEST_STOP))
+assert(unavailableDICKDState.shellContext ~= nil)
+assert(unavailableDICKDState.dickdStarts == 0)
+assert(hasLog(
+    unavailableDICKDState,
+    "error",
+    "Service supervisor unavailable"
+))
+
+local failedDICKDState, failedDICKDSucceeded, failedDICKDFailure =
+    runInitScenario({ dickdRuntimeFailure = true })
+assert(not failedDICKDSucceeded)
+assert(contains(failedDICKDFailure, SHELL_TEST_STOP))
+assert(failedDICKDState.shellContext ~= nil)
+assert(failedDICKDState.dickdStarts == 1)
+assert(failedDICKDState.parallelCalls == 1)
+assert(hasLog(failedDICKDState, "error", "Service supervisor failed"))
+
+local throwingDICKDState, throwingDICKDSucceeded, throwingDICKDFailure =
+    runInitScenario({ throwingDICKDAPI = true })
+assert(not throwingDICKDSucceeded)
+assert(contains(throwingDICKDFailure, SHELL_TEST_STOP))
+assert(throwingDICKDState.shellContext ~= nil)
+assert(throwingDICKDState.dickdStarts == 0)
+assert(hasLog(
+    throwingDICKDState,
+    "error",
+    "Service supervisor unavailable"
+))
 
 local invalidReturnState, invalidReturnSucceeded, invalidReturnFailure =
     runInitScenario({ invalidShellReturn = true })

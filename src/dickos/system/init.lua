@@ -11,6 +11,7 @@ local AUTH_LIBRARY_PATH = "/dickos/lib/auth.lua"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 local CONFIG_LIBRARY_PATH = "/dickos/lib/config.lua"
 local HARDWARE_LIBRARY_PATH = "/dickos/lib/hardware.lua"
+local DICKD_PATH = "/dickos/system/dickd.lua"
 local SYSTEM_CONFIG_PATH = "/dickos/etc/system.cfg"
 local STAGE0_RESTART_RESULT = "restart"
 local EXPECTED_RUNTIME_API_VERSION = 1
@@ -291,6 +292,52 @@ local function loadHardwareSubsystem()
     end
 
     return moduleOrError
+end
+
+-- dickd is noncritical runtime infrastructure. Loading it separately from the
+-- authentication/configuration core means a missing, broken, or incompatible
+-- supervisor disables only service management. Login, the DICK shell, and the
+-- independently optional hardware watcher remain available.
+local function loadDICKDSubsystem()
+    local loadSucceeded, programOrError, compileError = pcall(
+        loadfile,
+        DICKD_PATH
+    )
+
+    if not loadSucceeded or type(programOrError) ~= "function" then
+        local failure = loadSucceeded and compileError or programOrError
+        local message = "Service supervisor unavailable: unable to load " ..
+            "dickd: " .. tostring(failure)
+
+        logBestEffort(bootLogger, "warn", "dickd", message)
+        logBestEffort(systemLogger, "error", "dickd", message)
+        return nil
+    end
+
+    -- Execute and inspect the optional module within the same protected
+    -- boundary. A malformed return table may itself have a throwing __index;
+    -- that remains a noncritical unavailable supervisor rather than escaping
+    -- into Stage-0 Recovery.
+    local runSucceeded, runFunction = pcall(function()
+        local module = programOrError()
+
+        if type(module) ~= "table" or type(module.run) ~= "function" then
+            return nil
+        end
+
+        return module.run
+    end)
+
+    if not runSucceeded or type(runFunction) ~= "function" then
+        local message = "Service supervisor unavailable: dickd returned " ..
+            "an invalid API"
+
+        logBestEffort(bootLogger, "warn", "dickd", message)
+        logBestEffort(systemLogger, "error", "dickd", message)
+        return nil
+    end
+
+    return { run = runFunction }
 end
 
 -- Perform one real scan before authentication/session runtime begins. Every
@@ -920,12 +967,49 @@ local function runResilientHardwareWatcher(hardwareModule)
     end
 end
 
--- Run exactly one watcher beside the complete login/logout/session lifecycle.
--- CC:T's public parallel API gives each coroutine its own event-queue view, so
--- the watcher observes hotplug events without consuming keyboard, mouse,
--- timer, or terminate events needed by login, read(), sudo, and child commands.
-local function runWithHardwareWatcher(sessionLifecycle, hardwareModule)
-    if hardwareModule == nil then
+-- A crashing or unexpectedly returning supervisor is isolated exactly like a
+-- damaged hardware watcher: log once, then remain as an inert raw-event task.
+-- Remaining alive is important because waitForAny would otherwise stop the
+-- authenticated session even though dickd is explicitly noncritical.
+local function runResilientDICKD(dickdModule, dickdContext)
+    local supervisorSucceeded = pcall(
+        dickdModule.run,
+        dickdContext
+    )
+
+    local message
+
+    if supervisorSucceeded then
+        message = "Service supervisor stopped unexpectedly"
+    else
+        -- The supervisor classifies individual service failures internally.
+        -- Do not copy an unexpected raw exception here: it could have been
+        -- influenced by an ordinary event payload handled at the crash site.
+        message = "Service supervisor failed"
+    end
+
+    logBestEffort(systemLogger, "error", "dickd", message)
+
+    while true do
+        -- Ignore Ctrl+T in this degraded background task. The session task has
+        -- its own event copy and preserves all established child termination.
+        os.pullEventRaw()
+    end
+end
+
+-- Run one complete login/logout lifecycle beside at most one hardware watcher
+-- and one dickd instance. CC:T's public parallel API gives every sibling its
+-- own event-queue view, so background consumers cannot steal input, timers, or
+-- terminate events from login/read/editor/sudo. The protected session is the
+-- only task allowed to finish normally; logout loops inside that same task and
+-- therefore never duplicates either background component.
+local function runRuntimeTasks(
+    sessionLifecycle,
+    hardwareModule,
+    dickdModule,
+    dickdContext
+)
+    if hardwareModule == nil and dickdModule == nil then
         return sessionLifecycle()
     end
 
@@ -935,8 +1019,8 @@ local function runWithHardwareWatcher(sessionLifecycle, hardwareModule)
         logBestEffort(
             systemLogger,
             "error",
-            "hardware",
-            "Hardware watcher unavailable: parallel/raw event API missing"
+            "init",
+            "Background runtime unavailable: parallel/raw event API missing"
         )
         return sessionLifecycle()
     end
@@ -950,14 +1034,21 @@ local function runWithHardwareWatcher(sessionLifecycle, hardwareModule)
         sessionFinished = true
     end
 
-    local function hardwareWatcherLifecycle()
-        runResilientHardwareWatcher(hardwareModule)
+    local tasks = { protectedSessionLifecycle }
+
+    if hardwareModule ~= nil then
+        tasks[#tasks + 1] = function()
+            runResilientHardwareWatcher(hardwareModule)
+        end
     end
 
-    parallel.waitForAny(
-        protectedSessionLifecycle,
-        hardwareWatcherLifecycle
-    )
+    if dickdModule ~= nil then
+        tasks[#tasks + 1] = function()
+            runResilientDICKD(dickdModule, dickdContext)
+        end
+    end
+
+    parallel.waitForAny(table.unpack(tasks))
 
     if not sessionFinished then
         error("Runtime scheduler ended before the session lifecycle.", 0)
@@ -1004,6 +1095,7 @@ end
 
 local hardwareModule = loadHardwareSubsystem()
 performInitialHardwareDiscovery(hardwareModule)
+local dickdModule = loadDICKDSubsystem()
 
 -- Keep the returned module alive only as proof that all authentication core
 -- dependencies compiled and users.db validated. Login loads the same stateless
@@ -1039,6 +1131,17 @@ logBestEffort(bootLogger, "info", "init", "Login service ready")
 logBestEffort(systemLogger, "info", "init", "Login service ready")
 
 local loginContext = {
+    runtimeApiVersion = runtimeContext.apiVersion,
+    bootID = bootID,
+    version = version,
+    hostname = hostname,
+    machineID = machineID,
+}
+
+-- dickd and every service receive installation/runtime identity only. Keeping
+-- this table separate from loginContext and shellContext makes the absence of
+-- user, uid, admin, sudo, home, and cwd fields an explicit init contract.
+local dickdContext = {
     runtimeApiVersion = runtimeContext.apiVersion,
     bootID = bootID,
     version = version,
@@ -1126,4 +1229,9 @@ local function runSessionLifecycle()
     end
 end
 
-return runWithHardwareWatcher(runSessionLifecycle, hardwareModule)
+return runRuntimeTasks(
+    runSessionLifecycle,
+    hardwareModule,
+    dickdModule,
+    dickdContext
+)

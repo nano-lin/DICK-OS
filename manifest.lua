@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-hardware-foundation",
+    payloadID = "dickos-0.1.0-unstable-dickd-foundation",
 
     files = {
         {
@@ -26,6 +26,10 @@ return {
         {
             source = "src/dickos/system/login.lua",
             target = "/dickos/system/login.lua",
+        },
+        {
+            source = "src/dickos/system/dickd.lua",
+            target = "/dickos/system/dickd.lua",
         },
         {
             source = "src/dickos/lib/log.lua",
@@ -58,6 +62,10 @@ return {
         {
             source = "src/dickos/lib/hardware.lua",
             target = "/dickos/lib/hardware.lua",
+        },
+        {
+            source = "src/dickos/lib/service_client.lua",
+            target = "/dickos/lib/service_client.lua",
         },
         {
             source = "src/dickos/etc/system.cfg",
@@ -118,6 +126,14 @@ return {
         {
             source = "src/dickos/bin/peripherals.lua",
             target = "/dickos/bin/peripherals.lua",
+        },
+        {
+            source = "src/dickos/bin/services.lua",
+            target = "/dickos/bin/services.lua",
+        },
+        {
+            source = "src/dickos/bin/service.lua",
+            target = "/dickos/bin/service.lua",
         },
         {
             source = "src/dickos/bin/whoami.lua",
