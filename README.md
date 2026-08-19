@@ -51,5 +51,9 @@ persisted only as a salted PBKDF2-HMAC-SHA256 verifier in machine-specific
 ## Status
 
 Early development. The current unstable foundation includes native owner login,
-`whoami`, `id`, `passwd`, and logout-to-login. Sudo, filesystem permissions,
-and user-management commands are not implemented yet. Expect breaking changes.
+`whoami`, `id`, `passwd`, logout-to-login, session-scoped `sudo`, a shared
+filesystem mutation guard, and safe `touch`/`mkdir`/`cp`/`mv`/`rm` commands.
+This is an OS policy for official DICK commands, not a CC:T sandbox or Unix
+ACL model: arbitrary Lua, CraftOS, and Recovery can still call `fs` directly.
+Additional user-management commands are not implemented yet. Expect breaking
+changes.

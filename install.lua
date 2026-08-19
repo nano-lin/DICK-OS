@@ -897,8 +897,9 @@ end
 -- of any directory is fatal to this installation.
 local function createDirectoryLayout(ownerUsername)
     -- Owner and root home paths match the records written to users.db. Root's
-    -- directory exists for structural consistency even though direct root login
-    -- is disabled and no privilege-elevation milestone exists yet.
+    -- directory exists for structural consistency. Direct root login remains
+    -- disabled; sudo uses root only as a child command's effective identity and
+    -- deliberately keeps the authenticated owner's real home/cwd.
     local directories = {
         "/dickos/system",
         "/dickos/lib",

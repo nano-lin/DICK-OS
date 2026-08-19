@@ -8,7 +8,8 @@ if firstArgument == "--help" then
     return
 end
 
-if type(context) ~= "table" or type(context.user) ~= "string" then
+if type(context) ~= "table" or type(context.user) ~= "string" or
+    type(context.effectiveUser) ~= "string" then
     error("whoami requires authenticated DICK command context.", 0)
 end
 
@@ -16,4 +17,7 @@ if firstArgument ~= nil then
     error("Usage: whoami", 0)
 end
 
-print(context.user)
+-- `whoami` reports the identity under which this one command executes. The
+-- real session identity remains separately available as `context.user` and is
+-- restored automatically when the child returns to the shell.
+print(context.effectiveUser)

@@ -617,6 +617,7 @@ Target installed layout:
     │
     ├── lib/
     │   ├── log.lua
+    │   ├── fs_guard.lua
     │   ├── editor_buffer.lua
     │   ├── config.lua
     │   ├── password.lua
@@ -642,6 +643,11 @@ Target installed layout:
     │   ├── whoami.lua
     │   ├── id.lua
     │   ├── passwd.lua
+    │   ├── touch.lua
+    │   ├── mkdir.lua
+    │   ├── cp.lua
+    │   ├── mv.lua
+    │   ├── rm.lua
     │   ├── uname.lua
     │   └── uptime.lua
     ├── services/
@@ -1029,9 +1035,9 @@ Successful replacement cleans both reserved artifacts. This is a small
 best-effort config transaction, not a general filesystem transaction framework.
 
 There is no live reload or config-management CLI. Changes take effect on the
-next init/reboot and can currently be inspected or edited with ordinary DICK
-commands such as `cat /dickos/etc/system.cfg` and
-`edit /dickos/etc/system.cfg`.
+next init/reboot. Any user may inspect them with commands such as
+`cat /dickos/etc/system.cfg`; mutation is protected and therefore uses an
+explicit elevated command such as `sudo edit /dickos/etc/system.cfg`.
 
 ---
 
@@ -1045,8 +1051,10 @@ owner: UID 1000, admin=true, direct login enabled, salted verifier
 ```
 
 `next_uid` begins at 1001. Root's home is `/dickos/home/root`; the owner home is
-`/dickos/home/<username>`. The `admin` flag is role metadata reserved for later
-authorization work and does not currently grant sudo or filesystem powers.
+`/dickos/home/<username>`. The `admin` flag makes an account eligible to ask
+sudo for short-lived elevation. It does not itself authorize a mutation: the
+shared filesystem guard requires both an explicit elevated marker and effective
+UID 0 on the individual native-command context.
 
 The flat config-v1 representation is canonical and conceptually contains:
 
@@ -1155,27 +1163,58 @@ real Advanced Computer before tuning.
 
 # 22. sudo-like privileges
 
-This section remains future design. The users/authentication foundation records
-an admin role but implements no sudo command, elevation, authorization cache,
-filesystem permissions, or root command execution.
+`sudo` is an implemented DICK shell builtin with exactly these forms:
 
-Administrative actions may require elevated privileges.
+```text
+sudo <command> [args...]
+sudo -v
+sudo -k
+sudo --help
+```
 
-Example:
+Only an authenticated admin account may use it. Role rejection happens before
+password input. A real authorization asks for that account's own password with
+a masked prompt and calls the shared authentication policy. The returned name
+and UID must match the current session and the returned admin flag must remain
+true. Root keeps no usable password and direct root login remains disabled;
+`root` exists only as the effective identity of one approved child command.
+There is no root login, root password, persistent root shell, or sudoers file.
 
-nano@core-01:~$ sudo service restart dicknet
+Successful authorization is cached for 120 seconds according to `os.clock`,
+the monotonic time since this computer booted. The cache is a closure variable
+inside one shell instance: it is never written to config, runtime files, or
+logs, and logout/reboot destroys it naturally. `sudo -k` invalidates it.
+`sudo -v` always performs real reauthentication even while the cache is valid.
+Ctrl+T during masked input or a cooperative PBKDF2 yield prints
+`sudo: cancelled.`, leaves the cache unset, launches no child, records no
+credential failure, and returns to the same prompt and Boot ID.
 
-[sudo] password for nano:
+Sudo does not start another shell or parse another command language. It accepts
+only a plain command name which the existing resolver identifies as an
+external native `/dickos/bin` command, then invokes the existing protected
+executor. Builtins, explicit paths, user scripts, nested sudo, `-u`, `-s`,
+`-i`, and other Unix sudo modes are deliberately rejected. Child failure and
+Ctrl+T remain ordinary DICK shell child outcomes; terminal cleanup and the next
+prompt are unchanged.
 
-A successful authorization may be cached for a short session.
+Every native invocation receives real and effective identity explicitly:
 
-Ordinary commands must not require sudo.
+```text
+normal: user=nano uid=1000 effectiveUser=nano effectiveUID=1000 isElevated=false
+sudo:   user=nano uid=1000 effectiveUser=root effectiveUID=0 isElevated=true
+```
 
-The privilege model is intended to provide coherent OS behavior and prevent
-accidental changes.
+Home and cwd always belong to the real user. `whoami` reports the effective
+name, so `sudo whoami` prints `root`. Normal `id` remains
+`uid=1000(nano) groups=admin`; elevated `id` prints
+`uid=1000(nano) euid=0(root) groups=admin`. No password, verifier, auth module,
+or cache object enters command context, and the next command always receives a
+new non-elevated snapshot.
 
-It is not a hard security boundary against somebody who completely bypasses
-DICK/OS and obtains unrestricted lower-level execution.
+This privilege model provides coherent safety for official DICK interfaces; it
+is not a kernel boundary. Arbitrary Lua, CraftOS, or Recovery can call CC:T
+`fs` APIs directly and bypass it. There are no filesystem ACLs, ownership bits,
+process isolation, capability tokens, or sandbox in this milestone.
 
 ---
 
@@ -1231,11 +1270,14 @@ fatal runtime failure, or unexpected return is propagated through init to
 Stage-0 Recovery.
 
 Native programs under `/dickos/bin` receive a fresh first-argument context with
-runtime API version, Boot ID, version, hostname, Machine ID, username, UID,
-admin flag, home, and a cwd snapshot. It contains no verifier, users database,
-password, or auth module. Explicit user programs outside that directory receive
-only their typed arguments. Boot ID therefore remains runtime-only. `dicklog`
-also retains direct CraftOS-rescue invocation with ordinary arguments.
+runtime API version, Boot ID, version, hostname, Machine ID, real username/UID,
+effective username/UID, admin/elevation flags, real home, and a cwd snapshot.
+Normal execution makes real and effective identity equal; only the sudo builtin
+asks the same executor for effective root. The snapshot contains no verifier,
+users database, password, auth module, or sudo cache. Explicit user programs
+outside that directory receive only their typed arguments. Boot ID therefore
+remains runtime-only. `dicklog` also retains direct CraftOS-rescue invocation
+with ordinary arguments.
 
 `logout` returns the explicit session result consumed by init. `exit` never
 falls through to CraftOS; it directs the user to `logout`, `reboot`, or
@@ -1253,33 +1295,87 @@ separate from native editor viewport scrolling.
 
 The current shell-foundation built-ins are:
 
-- `help`, `clear`, `cd`, `pwd`, `which`, `exit`, `logout`.
+- `help`, `clear`, `cd`, `pwd`, `which`, `exit`, `logout`, `sudo`.
 
 The current external `/dickos/bin` commands are:
 
-- `ls`, `cat`, `echo`, `edit`;
+- `ls`, `cat`, `echo`, `edit`, `touch`, `mkdir`, `cp`, `mv`, `rm`;
 - `hostname`, `uname`, `uptime`, `df`, `status`;
 - `whoami`, `id`, `passwd`;
 - `reboot`, `shutdown`;
 - `dickfetch`, `dicklog`.
 
+`/dickos/lib/fs_guard.lua` is the shared mutation-policy helper. It performs
+lexical absolute normalisation, DICK cwd/home resolution, boundary-aware
+containment, risk classification, authorization, and high-risk confirmation.
+Exact match or a slash boundary is required, so `/dickos/systematic` is not a
+child of `/dickos/system` and `/dickos/home/nano-old` is not nano's home.
+
+Mutation risk classes are:
+
+- ordinary: the real user's home subtree, `/dickos/tmp`, and paths outside
+  `/dickos` except the two platform files listed below;
+- protected: all other `/dickos` paths, including another user's home;
+- critical: `/startup.lua`, `/.settings`, `/dickos/system/**`,
+  `/dickos/lib/**`, and exact `/dickos/etc/users.db`, `version`, `hostname`,
+  and `machine-id` metadata files;
+- catastrophic: destructive remove/move of `/` or `/dickos` itself.
+
+Protected, critical, and catastrophic mutations require a context with both
+`isElevated=true` and `effectiveUID=0` (the guard also validates effective root
+identity/admin state). A real account's `isAdmin=true` alone never authorizes a
+write. Critical and catastrophic operations additionally print a risk-specific
+warning and require the exact normalised absolute path to be typed. Empty,
+wrong, or Ctrl+T input cancels before mutation. The confirmation is required
+even when sudo's 120-second authentication cache is valid.
+
+The shared prompt names the operation and target and explains the relevant
+failure mode: Stage-0/automatic Recovery for `/startup.lua`, CraftOS startup
+policy for `/.settings`, boot/Recovery for core code, login failure for
+`users.db`, init metadata failure for identity files, and installation or
+filesystem destruction for catastrophic roots. It warns that manual
+Recovery/CraftOS repair may be required without calling ordinary mistakes
+permanently irreparable.
+
+All mutating commands use two phases. First they parse every argument, resolve
+actual destination semantics, inspect filesystem types/parents, classify every
+mutation, authorize the whole plan, and finish all confirmations. Only then do
+they call a mutating CC:T API. A later invalid multi-target argument therefore
+cannot leave earlier targets changed. A runtime `fs.*` failure can still occur
+after mutation begins because CC:T supplies no general filesystem transaction.
+
+Implemented command contracts are deliberately small:
+
+- `touch <file...>` creates only missing empty files; an existing file is left
+  byte-for-byte unchanged and directories are errors. No timestamp mode exists.
+- `mkdir [-p] <directory...>` requires an existing parent without `-p`.
+  `-p` preflights and classifies every missing intermediate before creating it.
+- `cp [-r] <source> <destination>` permits protected reads, requires `-r` for
+  directories, derives `destination/basename(source)` for a destination
+  directory, refuses overwrite and self/descendant copies, and guards the
+  actual destination.
+- `mv <source> <destination>` guards both source removal and actual destination,
+  refuses overwrite/self-descendant moves, and refuses to move the shell cwd or
+  one of its ancestors.
+- `rm [-r] <path...>` requires `-r` for directories, has no `-f`, rejects
+  overlapping target lists, and refuses the shell cwd or any ancestor.
+
+`/` and `/dickos` necessarily contain the DICK cwd. For those two destructive
+targets the mandatory catastrophic warning and exact prompt are shown first;
+even an exact answer is not a force flag, and the cwd-ancestor rule then still
+refuses mutation. This makes the risk visible while preserving the milestone's
+unconditional self-confusion guard.
+
+Read-only `ls` and `cat` do not require sudo. `edit` uses the same write guard:
+an ordinary protected target is rejected before the UI starts; elevated
+critical editing confirms exactly once before loading the document, and all
+saves in that editor invocation share that approval.
+
 The following planned 0.1.0 commands are not implemented by this milestone.
-
-Filesystem/userland:
-
-- touch
-- mkdir
-- cp
-- mv
-- rm
 
 System:
 
 - peripherals
-
-Users/authorization:
-
-- sudo
 
 Services:
 
@@ -1296,16 +1392,17 @@ Administration:
 
 - dickctl
 
-Commands may wrap suitable CraftOS functionality internally.
-
-The goal is a coherent DICK/OS interface, not rewriting every existing utility
-merely for ideological purity.
+The current filesystem coreutils use only public CC:T filesystem APIs. They do
+not add chmod/chown, ACLs, symlinks, mounts, trash, force overwrite/removal, or
+a general transaction engine. The goal is a coherent DICK/OS interface, not
+rewriting every existing utility merely for ideological purity.
 
 ---
 
 # 25. id / machine identity commands
 
-DICK/OS `id` should follow Unix-like semantics.
+DICK/OS `id` follows the small Unix-like real/effective identity semantics
+described above.
 
 Example:
 
@@ -1418,6 +1515,14 @@ clean line and is not created until Save. Directories and files larger than
 256 KiB are rejected before editing. Existing files are read completely, and
 new input is refused before the in-memory document would cross the same limit.
 
+Before inspecting or opening the target, the editor asks `fs_guard` to classify
+the intended write. An ordinary user may edit their own home or other ordinary
+paths, but a protected target is rejected with sudo guidance before the TUI.
+An elevated critical target requires its exact normalised path. That approval
+is collected once for the invocation and applies to later Ctrl+S operations;
+wrong/empty/Ctrl+T confirmation exits without starting the editor or mutating
+the file.
+
 The buffer is a list of lines without newline characters. It always contains
 at least one line, uses one-based line/column cursors, and preserves trailing
 empty lines. Save joins lines with LF and adds no unconditional final newline.
@@ -1476,8 +1581,15 @@ remain the shell's best-effort child failure/termination records.
 
 ### Runtime verification
 
-DICK EDIT v1 has been manually runtime-verified in Minecraft with CC:T. The
-confirmed paths include:
+DICK EDIT v1's native foundation has been manually runtime-verified in
+Minecraft with CC:T.
+
+The filesystem-guard/elevated-editor integration added by the current
+milestone has host-side coverage but has not yet been runtime-verified in
+Minecraft. The items below describe the previously verified native editor
+foundation; protected/critical edit behavior requires the new runtime plan.
+
+The previously confirmed paths include:
 
 - native editor startup and return to the DICK shell without a CraftOS prompt;
 - opening, creating, saving, and reopening files through relative, absolute,
@@ -1958,14 +2070,19 @@ keys, and diagnostics but never contain the complete file contents. The shell
 records startup, missing commands, ordinary command termination, and child
 load/runtime failures. Shell records include the resolved command name but
 deliberately omit the complete raw argument line so future secrets are not
-blindly copied into logs. Reboot and shutdown requests are also logged
-best-effort before invoking the real power API. `auth.log` records successful
-login/logout/password changes, secret-free login rejection categories and
-password-change rejections at WARN, plus phase-specific authentication-state,
-password-backend, verifier-generation, and users.db write failures. Unexpected
-backend exception text is not copied when it might contain credential material.
-The log never records passwords, password lengths, salts, digests, complete
-users.db contents, or raw commands.
+blindly copied into logs. Elevated starts add only the native command name;
+arbitrary path arguments are excluded. Reboot and shutdown requests are also
+logged best-effort before invoking the real power API. `auth.log` records
+successful login/logout/password changes, secret-free login rejection
+categories and password-change rejections at WARN, plus sudo grant/denial/cache
+invalidation and phase-specific authentication-state, password-backend,
+verifier-generation, and users.db write failures. Ctrl+T during sudo
+reauthentication is cancellation, not an auth failure. Unexpected backend
+exception text is not copied when it might contain credential material. Logs
+never record passwords, password lengths, salts, digests, complete users.db
+contents, raw commands, or arbitrary home filenames. A confirmed fixed
+critical system path is recorded with its command name because that path is the
+relevant security object.
 
 All files are bounded before appending a record which would cross their limit:
 

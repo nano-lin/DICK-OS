@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-users-auth-foundation",
+    payloadID = "dickos-0.1.0-unstable-sudo-fs-coreutils-foundation",
 
     files = {
         {
@@ -46,6 +46,10 @@ return {
         {
             source = "src/dickos/lib/auth.lua",
             target = "/dickos/lib/auth.lua",
+        },
+        {
+            source = "src/dickos/lib/fs_guard.lua",
+            target = "/dickos/lib/fs_guard.lua",
         },
         {
             source = "src/dickos/lib/editor_buffer.lua",
@@ -118,6 +122,26 @@ return {
         {
             source = "src/dickos/bin/passwd.lua",
             target = "/dickos/bin/passwd.lua",
+        },
+        {
+            source = "src/dickos/bin/touch.lua",
+            target = "/dickos/bin/touch.lua",
+        },
+        {
+            source = "src/dickos/bin/mkdir.lua",
+            target = "/dickos/bin/mkdir.lua",
+        },
+        {
+            source = "src/dickos/bin/cp.lua",
+            target = "/dickos/bin/cp.lua",
+        },
+        {
+            source = "src/dickos/bin/mv.lua",
+            target = "/dickos/bin/mv.lua",
+        },
+        {
+            source = "src/dickos/bin/rm.lua",
+            target = "/dickos/bin/rm.lua",
         },
         {
             source = "src/dickos/bin/reboot.lua",

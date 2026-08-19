@@ -9,7 +9,10 @@ local LOG_PATH = "/dickos/lib/log.lua"
 local context = {
     user = "nano",
     uid = 1000,
+    effectiveUser = "nano",
+    effectiveUID = 1000,
     isAdmin = true,
+    isElevated = false,
     machineID = "DCK-C-11-A91F",
     bootID = "B-1234ABCD",
 }
@@ -54,6 +57,25 @@ local idSucceeded, _, idOutput = runSimpleCommand(
 assert(idSucceeded)
 assert(idOutput[1] == "uid=1000(nano) groups=admin")
 assert(string.find(idOutput[1], "DCK-", 1, true) == nil)
+
+local elevatedContext = {}
+for key, value in pairs(context) do elevatedContext[key] = value end
+elevatedContext.effectiveUser = "root"
+elevatedContext.effectiveUID = 0
+elevatedContext.isElevated = true
+
+local elevatedWhoSucceeded, _, elevatedWhoOutput = runSimpleCommand(
+    "src/dickos/bin/whoami.lua",
+    elevatedContext
+)
+assert(elevatedWhoSucceeded and elevatedWhoOutput[1] == "root")
+local elevatedIDSuccess, _, elevatedIDOutput = runSimpleCommand(
+    "src/dickos/bin/id.lua",
+    elevatedContext
+)
+assert(elevatedIDSuccess)
+assert(elevatedIDOutput[1] ==
+    "uid=1000(nano) euid=0(root) groups=admin")
 local idHelpSucceeded, _, idHelp = runSimpleCommand(
     "src/dickos/bin/id.lua",
     context,

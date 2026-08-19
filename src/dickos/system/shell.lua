@@ -3,7 +3,9 @@
 
 local BIN_PATH = "/dickos/bin"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
+local AUTH_LIBRARY_PATH = "/dickos/lib/auth.lua"
 local EXPECTED_RUNTIME_API_VERSION = 1
+local SUDO_CACHE_SECONDS = 120
 
 local SHELL_BACKGROUND = colors.black
 local PRIMARY_TEXT = colors.white
@@ -104,7 +106,7 @@ validateSessionContext(sessionContext)
 -- correctness boundary: module compilation, execution, table access, and
 -- logger construction all happen inside one protected call. nil therefore
 -- means only that diagnostics are unavailable.
-local function createBestEffortLogger(context)
+local function createBestEffortLogger(targetName, context)
     local constructionSucceeded, logger = pcall(function()
         local loggerProgram = loadfile(LOG_LIBRARY_PATH)
 
@@ -119,7 +121,7 @@ local function createBestEffortLogger(context)
             return nil
         end
 
-        local createdLogger = logModule.create("system", context)
+        local createdLogger = logModule.create(targetName, context)
 
         if type(createdLogger) ~= "table" then
             return nil
@@ -135,7 +137,8 @@ local function createBestEffortLogger(context)
     return logger
 end
 
-local systemLogger = createBestEffortLogger(sessionContext)
+local systemLogger = createBestEffortLogger("system", sessionContext)
+local authLogger = createBestEffortLogger("auth", sessionContext)
 
 -- Invoke one logger method without trusting the module or filesystem. The
 -- complete raw command line is deliberately never passed here, establishing a
@@ -150,6 +153,23 @@ local function logBestEffort(level, component, message)
 
         if type(levelMethod) == "function" then
             levelMethod(component, message)
+        end
+    end)
+end
+
+-- Authentication events have a separate retention target. As with system.log,
+-- logger failure never changes authorization behaviour and messages are built
+-- only from trusted phase labels and the authenticated username.
+local function logAuthBestEffort(level, message)
+    if authLogger == nil then
+        return
+    end
+
+    pcall(function()
+        local levelMethod = authLogger[level]
+
+        if type(levelMethod) == "function" then
+            levelMethod("sudo", message)
         end
     end)
 end
@@ -465,9 +485,14 @@ local function discoverExternalCommands()
 end
 
 -- Native DICK commands receive a fresh snapshot rather than the mutable shell
--- session table. Explicit user scripts receive only their typed arguments, so
--- ordinary `local firstArgument = ...` programs keep intuitive Lua behaviour.
-local function buildCommandContext()
+-- session table. `user`/`uid`, home, and cwd always describe the authenticated
+-- human session. Only sudo-created snapshots replace the effective identity;
+-- no password, verifier, auth module, or cache reference crosses this boundary.
+-- Explicit user scripts receive only their typed arguments, so ordinary
+-- `local firstArgument = ...` programs keep intuitive Lua behaviour.
+local function buildCommandContext(elevated)
+    local isElevated = elevated == true
+
     return {
         runtimeApiVersion = sessionContext.runtimeApiVersion,
         bootID = sessionContext.bootID,
@@ -476,13 +501,17 @@ local function buildCommandContext()
         machineID = sessionContext.machineID,
         user = sessionContext.user,
         uid = sessionContext.uid,
-        isAdmin = sessionContext.isAdmin,
+        effectiveUser = isElevated and "root" or sessionContext.user,
+        effectiveUID = isElevated and 0 or sessionContext.uid,
+        isAdmin = isElevated and true or sessionContext.isAdmin,
+        isElevated = isElevated,
         home = homeDirectory,
         cwd = currentWorkingDirectory,
     }
 end
 
 local executeResolvedCommand
+local sudoCacheExpiresAt = nil
 
 local function printBuiltinHelp(commandName, builtin)
     print(commandName .. " - " .. builtin.summary)
@@ -656,6 +685,262 @@ local function runLogout(arguments)
     return "logout"
 end
 
+local function printSudoHelp()
+    print("sudo - run one native DICK command with effective UID 0")
+    print("Usage: sudo <command> [args...]")
+    print("       sudo -v")
+    print("       sudo -k")
+    print("       sudo --help")
+end
+
+-- Load authentication only for an actual reauthentication attempt. Keeping it
+-- outside the long-lived shell state avoids exposing the module to commands;
+-- a missing, malformed, or crashing dependency is a safe sudo denial rather
+-- than a shell/Recovery failure.
+local function loadSudoAuthentication()
+    local loadSucceeded, programOrError = pcall(
+        loadfile,
+        AUTH_LIBRARY_PATH
+    )
+
+    if not loadSucceeded or type(programOrError) ~= "function" then
+        return nil
+    end
+
+    local runSucceeded, moduleOrError = pcall(programOrError)
+
+    if not runSucceeded or type(moduleOrError) ~= "table" or
+        type(moduleOrError.authenticate) ~= "function" then
+        return nil
+    end
+
+    return moduleOrError
+end
+
+local function readSudoClock()
+    local succeeded, value = pcall(os.clock)
+
+    if not succeeded or type(value) ~= "number" then
+        return nil
+    end
+
+    return value
+end
+
+local function sudoCacheIsValid()
+    if sudoCacheExpiresAt == nil then
+        return false
+    end
+
+    local now = readSudoClock()
+
+    if now == nil or now >= sudoCacheExpiresAt then
+        sudoCacheExpiresAt = nil
+        return false
+    end
+
+    return true
+end
+
+-- Reauthenticate the real session account. Ctrl+T may arise either from the
+-- masked `read` or from PBKDF2's cooperative `sleep(0)` yield. Both paths are
+-- ordinary builtin cancellation: they set no cache, launch no child, write no
+-- authentication-failure event, and return to this same shell instance.
+local function refreshSudoAuthentication()
+    -- A forced validation must not fall back to an older still-valid grant if
+    -- the new prompt is denied, cancelled, or the backend fails.
+    sudoCacheExpiresAt = nil
+
+    local auth = loadSudoAuthentication()
+
+    if auth == nil then
+        logAuthBestEffort("error", "Sudo authentication backend unavailable")
+        printShellError("sudo: authentication unavailable.")
+        return false
+    end
+
+    write("[sudo] password for " .. sessionContext.user .. ": ")
+    local readSucceeded, passwordOrError = pcall(read, "*")
+
+    if not readSucceeded then
+        print()
+
+        if isTerminationError(passwordOrError) then
+            print("sudo: cancelled.")
+        else
+            logAuthBestEffort(
+                "error",
+                "Sudo password input failed for " .. sessionContext.user
+            )
+            printShellError("sudo: authentication unavailable.")
+        end
+
+        return false
+    end
+
+    local plainPassword = passwordOrError
+    local callSucceeded, identity, resultKind = pcall(
+        auth.authenticate,
+        sessionContext.user,
+        plainPassword
+    )
+
+    -- Lua strings cannot be overwritten reliably, but dropping this reference
+    -- keeps the plaintext's useful lifetime as short as this VM permits.
+    plainPassword = nil
+
+    if not callSucceeded then
+        if isTerminationError(identity) then
+            print()
+            print("sudo: cancelled.")
+            return false
+        end
+
+        logAuthBestEffort("error", "Sudo authentication backend failed")
+        printShellError("sudo: authentication unavailable.")
+        return false
+    end
+
+    if resultKind == "denied" then
+        logAuthBestEffort(
+            "warn",
+            "Sudo authorization denied for " .. sessionContext.user ..
+                " uid=" .. tostring(sessionContext.uid)
+        )
+        printShellError("sudo: authentication failed.")
+        return false
+    end
+
+    if type(identity) ~= "table" then
+        logAuthBestEffort("error", "Sudo authentication state unavailable")
+        printShellError("sudo: authentication unavailable.")
+        return false
+    end
+
+    -- Successful password verification is not enough if a broken/replaced
+    -- backend returns another account or silently removes the admin role.
+    if identity.name ~= sessionContext.user or
+        identity.uid ~= sessionContext.uid or identity.admin ~= true then
+        logAuthBestEffort("error", "Sudo authenticated identity mismatch")
+        printShellError("sudo: authentication unavailable.")
+        return false
+    end
+
+    local now = readSudoClock()
+
+    if now == nil then
+        logAuthBestEffort("error", "Sudo monotonic clock unavailable")
+        printShellError("sudo: authentication unavailable.")
+        return false
+    end
+
+    sudoCacheExpiresAt = now + SUDO_CACHE_SECONDS
+    logAuthBestEffort(
+        "info",
+        "Sudo authorization granted for " .. sessionContext.user ..
+            " uid=" .. tostring(sessionContext.uid)
+    )
+    return true
+end
+
+local function runSudo(arguments)
+    if arguments[1] == "--help" and #arguments == 1 then
+        printSudoHelp()
+        return
+    end
+
+    if arguments[1] == "-k" and #arguments == 1 then
+        sudoCacheExpiresAt = nil
+        logAuthBestEffort(
+            "info",
+            "Sudo authorization cache invalidated for " ..
+                sessionContext.user .. " uid=" ..
+                tostring(sessionContext.uid)
+        )
+        return
+    end
+
+    local validationOnly = arguments[1] == "-v" and #arguments == 1
+
+    if #arguments == 0 or
+        (string.sub(tostring(arguments[1]), 1, 1) == "-" and
+            not validationOnly) then
+        printShellError("Usage: " .. builtins.sudo.usage)
+        return
+    end
+
+    -- Role denial happens before loading auth or displaying a password prompt.
+    -- Root remains direct-login-disabled; sudo is available only to a real
+    -- authenticated admin account and creates UID 0 solely as child context.
+    if sessionContext.isAdmin ~= true then
+        logAuthBestEffort(
+            "warn",
+            "Sudo denied for non-admin account " .. sessionContext.user ..
+                " uid=" .. tostring(sessionContext.uid)
+        )
+        printShellError("sudo: account is not an administrator.")
+        return
+    end
+
+    local resolution = nil
+    local childArguments = {}
+
+    if not validationOnly then
+        local commandName = arguments[1]
+
+        if commandName == "sudo" then
+            printShellError("sudo: nested sudo is not supported.")
+            return
+        end
+
+        if isExplicitProgramPath(commandName) then
+            printShellError(
+                "sudo: explicit program paths cannot be elevated."
+            )
+            return
+        end
+
+        resolution = resolveCommand(commandName)
+
+        if resolution == nil then
+            printShellError("sudo: command not found: " .. commandName)
+            return
+        end
+
+        if resolution.kind ~= "program" or resolution.native ~= true then
+            printShellError(
+                "sudo: only native /dickos/bin commands may be elevated."
+            )
+            return
+        end
+
+        for argumentIndex = 2, #arguments do
+            childArguments[#childArguments + 1] = arguments[argumentIndex]
+        end
+    end
+
+    -- `sudo -v` always performs the expensive real check. An ordinary sudo
+    -- command may reuse only this shell instance's unexpired monotonic cache.
+    if validationOnly or not sudoCacheIsValid() then
+        if not refreshSudoAuthentication() then
+            return
+        end
+    else
+        logAuthBestEffort(
+            "info",
+            "Sudo authorization cache accepted for " ..
+                sessionContext.user .. " uid=" ..
+                tostring(sessionContext.uid)
+        )
+    end
+
+    if validationOnly then
+        return
+    end
+
+    return executeResolvedCommand(resolution, childArguments, true)
+end
+
 builtins.help = {
     summary = "show built-in and DICK command help",
     usage = "help [command]",
@@ -691,12 +976,17 @@ builtins.logout = {
     usage = "logout",
     run = runLogout,
 }
+builtins.sudo = {
+    summary = "run one native DICK command with effective UID 0",
+    usage = "sudo <command> [args...] | sudo -v | sudo -k",
+    run = runSudo,
+}
 
 -- Compile and run one external program behind a protected boundary. Load and
 -- runtime failures are child-command failures: they are printed and logged,
 -- then control returns to the prompt. They never propagate into init or
 -- Recovery. Source/line diagnostics are preserved on the terminal.
-executeResolvedCommand = function(resolution, arguments)
+executeResolvedCommand = function(resolution, arguments, elevated)
     local _, commandStartRow = term.getCursorPos()
     local loadCallSucceeded, program, loadError = pcall(
         loadfile,
@@ -720,11 +1010,22 @@ executeResolvedCommand = function(resolution, arguments)
     local invocationArguments = {}
 
     if resolution.native then
-        invocationArguments[#invocationArguments + 1] = buildCommandContext()
+        invocationArguments[#invocationArguments + 1] =
+            buildCommandContext(elevated)
     end
 
     for _, argument in ipairs(arguments) do
         invocationArguments[#invocationArguments + 1] = argument
+    end
+
+    if elevated == true then
+        -- Only the resolved native command name is logged. Arguments may carry
+        -- arbitrary user paths or future secret-like values and are excluded.
+        logBestEffort(
+            "info",
+            "sudo",
+            "Elevated command started: " .. resolution.name
+        )
     end
 
     local commandSucceeded, commandError = pcall(

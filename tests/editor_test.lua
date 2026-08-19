@@ -4,6 +4,8 @@
 local EDITOR_SOURCE = "src/dickos/bin/edit.lua"
 local BUFFER_SOURCE = "src/dickos/lib/editor_buffer.lua"
 local INSTALLED_BUFFER_PATH = "/dickos/lib/editor_buffer.lua"
+local GUARD_SOURCE = "src/dickos/lib/fs_guard.lua"
+local INSTALLED_GUARD_PATH = "/dickos/lib/fs_guard.lua"
 local TEST_STOP = "__DICK_EDITOR_TEST_EVENT_QUEUE_EMPTY__"
 
 local hostLoadfile = loadfile
@@ -302,6 +304,8 @@ local function runEditor(options)
         blink = nil,
         cursorX = 1,
         cursorY = 1,
+        confirmationIndex = 0,
+        confirmationReads = 0,
         eventIndex = 0,
         files = copyTable(options.files),
         frames = {},
@@ -476,6 +480,22 @@ local function runEditor(options)
         state.output[#state.output + 1] = table.concat(values, "\t")
     end
 
+    environment.write = function(value)
+        state.output[#state.output + 1] = tostring(value or "")
+    end
+
+    environment.read = function()
+        state.confirmationReads = state.confirmationReads + 1
+        state.confirmationIndex = state.confirmationIndex + 1
+        local value = (options.confirmations or {})[state.confirmationIndex]
+
+        if type(value) == "table" and value.error ~= nil then
+            error(value.error, 0)
+        end
+
+        return value
+    end
+
     environment.os = {
         pullEvent = function()
             state.frames[#state.frames + 1] =
@@ -506,8 +526,15 @@ local function runEditor(options)
     setmetatable(environment, { __index = _G })
     environment._G = environment
     environment.loadfile = function(path)
-        assert(path == INSTALLED_BUFFER_PATH)
-        return hostLoadfile(BUFFER_SOURCE, "t", environment)
+        if path == INSTALLED_BUFFER_PATH then
+            return hostLoadfile(BUFFER_SOURCE, "t", environment)
+        end
+
+        if path == INSTALLED_GUARD_PATH then
+            return hostLoadfile(GUARD_SOURCE, "t", environment)
+        end
+
+        error("unexpected editor load path: " .. tostring(path), 0)
     end
 
     local editorProgram = assert(hostLoadfile(
@@ -518,6 +545,10 @@ local function runEditor(options)
     local commandContext = options.context or {
         cwd = "/dickos/home/bootstrap/projects",
         home = "/dickos/home/bootstrap",
+        effectiveUser = "bootstrap",
+        effectiveUID = 1000,
+        isAdmin = true,
+        isElevated = false,
     }
     local succeeded, failure
 
@@ -568,6 +599,80 @@ for _, pathCase in ipairs(pathCases) do
     assert(succeeded, tostring(failure))
     assert(state.inspectedPaths[1] == pathCase[2])
 end
+
+local protectedState, protectedSucceeded, protectedFailure = runEditor({
+    requestedPath = "/dickos/etc/system.cfg",
+})
+assert(not protectedSucceeded)
+assertContains(protectedFailure, "use sudo")
+assert(protectedState.inspectedPaths[1] == "/dickos/etc/system.cfg")
+assert(protectedState.confirmationReads == 0)
+
+local elevatedEditorContext = {
+    cwd = "/dickos/home/bootstrap/projects",
+    home = "/dickos/home/bootstrap",
+    effectiveUser = "root",
+    effectiveUID = 0,
+    isAdmin = true,
+    isElevated = true,
+}
+local elevatedProtectedState, elevatedProtectedSucceeded,
+    elevatedProtectedFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = "/dickos/etc/system.cfg",
+        events = cleanQuitEvents(),
+    })
+assert(elevatedProtectedSucceeded, tostring(elevatedProtectedFailure))
+assert(elevatedProtectedState.confirmationReads == 0)
+
+local criticalCancelledState, criticalCancelledSucceeded,
+    criticalCancelledFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = "/startup.lua",
+        confirmations = { "/startup.lua-wrong" },
+    })
+assert(criticalCancelledSucceeded, tostring(criticalCancelledFailure))
+assert(criticalCancelledState.confirmationReads == 1)
+assert(criticalCancelledState.inspectedPaths[1] == "/startup.lua")
+assertContains(criticalCancelledState.outputText, "Operation cancelled.")
+
+local criticalTerminatedState, criticalTerminatedSucceeded,
+    criticalTerminatedFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = "/startup.lua",
+        confirmations = { { error = "Terminated" } },
+    })
+assert(criticalTerminatedSucceeded, tostring(criticalTerminatedFailure))
+assert(criticalTerminatedState.confirmationReads == 1)
+assert(criticalTerminatedState.inspectedPaths[1] == "/startup.lua")
+
+local criticalOpenedState, criticalOpenedSucceeded, criticalOpenedFailure =
+    runEditor({
+        context = elevatedEditorContext,
+        requestedPath = "/startup.lua",
+        confirmations = { "/startup.lua" },
+        files = { ["/startup.lua"] = "boot" },
+        events = cleanQuitEvents(),
+    })
+assert(criticalOpenedSucceeded, tostring(criticalOpenedFailure))
+assert(criticalOpenedState.confirmationReads == 1)
+assert(criticalOpenedState.inspectedPaths[1] == "/startup.lua")
+
+local criticalSaveEvents = { { "char", "x" } }
+appendControlKey(criticalSaveEvents, keysMock.s)
+appendControlKey(criticalSaveEvents, keysMock.s)
+appendControlKey(criticalSaveEvents, keysMock.q)
+local criticalSaveState, criticalSaveSucceeded, criticalSaveFailure =
+    runEditor({
+        context = elevatedEditorContext,
+        requestedPath = "/startup.lua",
+        confirmations = { "/startup.lua" },
+        files = { ["/startup.lua"] = "boot" },
+        events = criticalSaveEvents,
+    })
+assert(criticalSaveSucceeded, tostring(criticalSaveFailure))
+assert(criticalSaveState.confirmationReads == 1)
+assert(criticalSaveState.files["/startup.lua"] == "xboot")
 
 local homeState, homeSucceeded, homeFailure = runEditor({
     requestedPath = "~",

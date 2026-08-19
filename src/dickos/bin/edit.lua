@@ -2,6 +2,7 @@
 -- Version: 0.1.0-unstable
 
 local BUFFER_LIBRARY_PATH = "/dickos/lib/editor_buffer.lua"
+local GUARD_LIBRARY_PATH = "/dickos/lib/fs_guard.lua"
 local MAXIMUM_FILE_BYTES = 256 * 1024
 
 -- Forty-two columns fit both shortcut labels beside useful cursor coordinates.
@@ -46,7 +47,11 @@ local function validateCommandContext(commandContext)
         type(commandContext.cwd) ~= "string" or
         type(commandContext.home) ~= "string" or
         string.sub(commandContext.cwd, 1, 1) ~= "/" or
-        string.sub(commandContext.home, 1, 1) ~= "/" then
+        string.sub(commandContext.home, 1, 1) ~= "/" or
+        type(commandContext.effectiveUser) ~= "string" or
+        type(commandContext.effectiveUID) ~= "number" or
+        type(commandContext.isAdmin) ~= "boolean" or
+        type(commandContext.isElevated) ~= "boolean" then
         error("edit requires DICK command context.", 0)
     end
 end
@@ -63,55 +68,40 @@ if type(requestedPath) ~= "string" or requestedPath == "" or
     error("Usage: edit <file>", 0)
 end
 
--- Normalise an absolute path with the same rules as the DICK shell. Empty and
--- `.` segments disappear, while `..` removes one segment but clamps at `/`.
--- This is lexical normalisation; DICK/OS does not invent Unix mounts,
--- permissions, or symbolic-link semantics here.
-local function normalizeAbsolutePath(path)
-    local segments = {}
+local function loadFilesystemGuard()
+    local program, loadError = loadfile(GUARD_LIBRARY_PATH)
 
-    for segment in string.gmatch(tostring(path), "[^/]+") do
-        if segment == ".." then
-            if #segments > 0 then
-                table.remove(segments)
-            end
-        elseif segment ~= "." and segment ~= "" then
-            segments[#segments + 1] = segment
+    if type(program) ~= "function" then
+        error("edit: unable to load filesystem guard: " ..
+            describeError(loadError), 0)
+    end
+
+    local module = program()
+
+    for _, functionName in ipairs({
+        "normalize",
+        "resolve",
+        "inspect",
+        "authorize",
+        "confirm",
+    }) do
+        if type(module) ~= "table" or
+            type(module[functionName]) ~= "function" then
+            error("edit: invalid filesystem guard.", 0)
         end
     end
 
-    if #segments == 0 then
-        return "/"
-    end
-
-    return "/" .. table.concat(segments, "/")
+    return module
 end
 
--- Expand only the documented `~` and `~/...` forms. Every other relative path
--- starts at the cwd snapshot supplied for this one command invocation.
-local function resolvePath(path)
-    if path == "~" then
-        return normalizeAbsolutePath(context.home)
-    end
 
-    if string.sub(path, 1, 2) == "~/" then
-        return normalizeAbsolutePath(
-            context.home .. "/" .. string.sub(path, 3)
-        )
-    end
-
-    if string.sub(path, 1, 1) == "/" then
-        return normalizeAbsolutePath(path)
-    end
-
-    return normalizeAbsolutePath(context.cwd .. "/" .. path)
-end
+local filesystemGuard = loadFilesystemGuard()
 
 -- Shorten the exact home directory and its descendants for the title bar.
 -- Checking the slash-terminated prefix avoids treating a neighbour such as
 -- `/home/nano-old` as if it were inside `/home/nano`.
 local function displayPath(path)
-    local home = normalizeAbsolutePath(context.home)
+    local home = assert(filesystemGuard.normalize(context.home))
 
     if path == home then
         return "~"
@@ -126,8 +116,84 @@ local function displayPath(path)
     return path
 end
 
-local targetPath = resolvePath(requestedPath)
+local targetPath, targetResolveError = filesystemGuard.resolve(
+    context,
+    requestedPath
+)
+
+if targetPath == nil then
+    error("edit: " .. tostring(targetResolveError) .. ".", 0)
+end
+
 local displayedTargetPath = displayPath(targetPath)
+
+-- Validate the non-mutating filesystem semantics before authorization and
+-- confirmation. The later loader repeats these checks at the moment it reads
+-- the file, but this first phase prevents asking for a critical-path approval
+-- when the target is already known to be a directory or oversized.
+local function preflightTarget(path)
+    local inspectionSucceeded, existsOrError, isDirectory, size = pcall(
+        function()
+            if not fs.exists(path) then
+                return false, false, 0
+            end
+
+            local directory = fs.isDir(path)
+            local fileSize = directory and 0 or fs.getSize(path)
+            return true, directory, fileSize
+        end
+    )
+
+    if not inspectionSucceeded then
+        error("edit: unable to inspect " .. path .. ": " ..
+            describeError(existsOrError), 0)
+    end
+
+    if existsOrError and isDirectory then
+        error("edit: cannot edit a directory: " .. path, 0)
+    end
+
+    if existsOrError and type(size) ~= "number" then
+        error("edit: file size is unavailable: " .. path, 0)
+    end
+
+    if existsOrError and size > MAXIMUM_FILE_BYTES then
+        error("File is too large for DICK EDIT.", 0)
+    end
+end
+
+preflightTarget(targetPath)
+
+-- Authorization and any exact-path confirmation happen before the target is
+-- inspected or the full-screen editor starts. One approved inspection covers
+-- all Ctrl+S writes during this invocation; Save never re-prompts mid-session.
+local targetInspection, targetInspectionError = filesystemGuard.inspect(
+    targetPath,
+    "write",
+    context
+)
+
+if targetInspection == nil then
+    error("edit: " .. tostring(targetInspectionError) .. ".", 0)
+end
+
+local targetInspections = { targetInspection }
+local targetAuthorised, targetAuthorisationError =
+    filesystemGuard.authorize(targetInspections, context)
+
+if not targetAuthorised then
+    error("edit: " .. targetAuthorisationError .. ".", 0)
+end
+
+local targetConfirmed = filesystemGuard.confirm(
+    targetInspections,
+    "edit",
+    context
+)
+
+if not targetConfirmed then
+    return
+end
 
 -- Load the small DICK-owned buffer model explicitly. The DICK shell does not
 -- expose CraftOS's program-specific `require`/`package` environment, and the

@@ -10,7 +10,10 @@ end
 
 
 if type(context) ~= "table" or type(context.user) ~= "string" or
-    type(context.uid) ~= "number" or type(context.isAdmin) ~= "boolean" then
+    type(context.uid) ~= "number" or type(context.isAdmin) ~= "boolean" or
+    type(context.effectiveUser) ~= "string" or
+    type(context.effectiveUID) ~= "number" or
+    type(context.isElevated) ~= "boolean" then
     error("id requires authenticated DICK command context.", 0)
 end
 
@@ -20,4 +23,20 @@ end
 
 local groups = context.isAdmin and "admin" or "user"
 
-print(string.format("uid=%d(%s) groups=%s", context.uid, context.user, groups))
+if context.isElevated then
+    print(string.format(
+        "uid=%d(%s) euid=%d(%s) groups=%s",
+        context.uid,
+        context.user,
+        context.effectiveUID,
+        context.effectiveUser,
+        groups
+    ))
+else
+    print(string.format(
+        "uid=%d(%s) groups=%s",
+        context.uid,
+        context.user,
+        groups
+    ))
+end
