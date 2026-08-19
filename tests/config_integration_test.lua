@@ -92,6 +92,8 @@ local function runInitScenario(options)
         shellContext = nil,
         shellContexts = {},
         loginCount = 0,
+        dickfetchCount = 0,
+        lifecycle = {},
         timerCount = 0,
     }
     local metadata = {
@@ -189,7 +191,14 @@ local function runInitScenario(options)
         end
 
         if path == DICKFETCH_PATH then
-            return function() end
+            return function()
+                state.dickfetchCount = state.dickfetchCount + 1
+                state.lifecycle[#state.lifecycle + 1] = "dickfetch"
+
+                if options.brokenDickfetch then
+                    error("simulated dickfetch failure", 0)
+                end
+            end
         end
 
         if path == AUTH_PATH then
@@ -217,6 +226,7 @@ local function runInitScenario(options)
 
             return function()
                 state.loginCount = state.loginCount + 1
+                state.lifecycle[#state.lifecycle + 1] = "login"
                 return {
                     name = "nano",
                     uid = 1000,
@@ -228,6 +238,7 @@ local function runInitScenario(options)
 
         if path == INSTALLED_SHELL_PATH then
             return function(context)
+                state.lifecycle[#state.lifecycle + 1] = "shell"
                 state.shellContext = context
                 state.shellContexts[#state.shellContexts + 1] = context
 
@@ -269,6 +280,8 @@ assert(delayedState.shellContext.verifier == nil)
 assert(delayedState.shellContext.users == nil)
 assert(delayedState.shellContext.auth == nil)
 assert(delayedState.timerCount == 24)
+assert(table.concat(delayedState.lifecycle, ",") ==
+    "login,dickfetch,shell")
 assert(hasLog(delayedState, "info", "Configuration library loaded"))
 assert(hasLog(delayedState, "info", "System configuration loaded"))
 
@@ -349,7 +362,17 @@ local missingLoginState, missingLoginSucceeded, missingLoginFailure =
     runInitScenario({ missingLoginModule = true })
 assert(not missingLoginSucceeded)
 assert(missingLoginState.shellContext == nil)
+assert(missingLoginState.dickfetchCount == 0)
 assert(contains(missingLoginFailure, "Unable to load DICK login"))
+
+local brokenDickfetchState, brokenDickfetchSucceeded, brokenDickfetchFailure =
+    runInitScenario({ brokenDickfetch = true })
+assert(not brokenDickfetchSucceeded)
+assert(contains(brokenDickfetchFailure, SHELL_TEST_STOP))
+assert(brokenDickfetchState.shellContext ~= nil)
+assert(table.concat(brokenDickfetchState.lifecycle, ",") ==
+    "login,dickfetch,shell")
+assert(hasLog(brokenDickfetchState, "warn", "Presentation failure"))
 
 local logoutState, logoutSucceeded, logoutFailure = runInitScenario({
     logoutOnce = true,
@@ -363,7 +386,10 @@ local logoutState, logoutSucceeded, logoutFailure = runInitScenario({
 assert(not logoutSucceeded)
 assert(contains(logoutFailure, SHELL_TEST_STOP))
 assert(logoutState.loginCount == 2)
+assert(logoutState.dickfetchCount == 2)
 assert(#logoutState.shellContexts == 2)
+assert(table.concat(logoutState.lifecycle, ",") ==
+    "login,dickfetch,shell,login,dickfetch,shell")
 assert(logoutState.shellContexts[1].bootID == "B-1234ABCD")
 assert(logoutState.shellContexts[2].bootID == "B-1234ABCD")
 assert(logoutState.shellContexts[1].uid == 1000)

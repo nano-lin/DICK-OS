@@ -39,6 +39,50 @@ assert(password.pbkdf2("password", "salt", 2, 32) ==
     "ae4d0c95af6b46d32d0adff928f06dd" ..
     "02a303f8ef3c251dfd6e2d85a95474c43")
 
+-- Desktop Lua has no CC:T `sleep`, so the module accepts a private per-instance
+-- callback for this scheduling test. The same input is derived once without
+-- and once with cooperative yields. Equal digests prove scheduling does not
+-- become part of PBKDF2's byte computation, while the counter proves the
+-- 256-round path actually ran.
+local yieldCount = 0
+local yieldingPassword = program({
+    cooperativeYield = function()
+        yieldCount = yieldCount + 1
+    end,
+})
+local uninterruptedDigest = password.pbkdf2(
+    "yield-test-password",
+    "yield-test-salt",
+    512,
+    32
+)
+local yieldedDigest = yieldingPassword.pbkdf2(
+    "yield-test-password",
+    "yield-test-salt",
+    512,
+    32
+)
+assert(yieldedDigest == uninterruptedDigest)
+assert(yieldCount == 2)
+
+-- A termination raised by the cooperative callback must escape PBKDF2. The
+-- production callback is CC:T `sleep(0)`, which raises the same value when the
+-- user presses Ctrl+T.
+local terminatingPassword = program({
+    cooperativeYield = function()
+        error("Terminated", 0)
+    end,
+})
+local derivationSucceeded, derivationError = pcall(
+    terminatingPassword.pbkdf2,
+    "yield-test-password",
+    "yield-test-salt",
+    256,
+    32
+)
+assert(not derivationSucceeded)
+assert(tostring(derivationError) == "Terminated")
+
 local valid, validationError = password.validatePassword("12345678")
 assert(valid, tostring(validationError))
 assert(not password.validatePassword("1234567"))

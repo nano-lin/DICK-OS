@@ -77,6 +77,24 @@ local function logBestEffort(level, message)
     end)
 end
 
+-- auth.authenticate returns a private rejection category for trusted logging.
+-- This map contains no user input and no verifier data. Every category still
+-- produces the same UI notice below, so the screen does not reveal whether an
+-- account exists or permits direct login.
+local REJECTION_LOG_MESSAGES = {
+    unknown_user = "Login rejected: unknown user",
+    incorrect_password = "Login rejected: incorrect password",
+    direct_login_disabled = "Login rejected: direct login disabled",
+}
+
+-- Backend detail values are also fixed auth.lua codes, never exception text.
+-- Mapping rather than concatenating them keeps auth.log diagnostic while a
+-- future backend cannot smuggle credential material through this boundary.
+local BACKEND_LOG_MESSAGES = {
+    login_password_verification_failed =
+        "Login password verification backend failed",
+}
+
 local function drawLogin(notice)
     local width = term.getSize()
 
@@ -133,7 +151,13 @@ while true do
             end
         else
             local plainPassword = tostring(passwordOrError)
-            local user, resultKind, detail = auth.authenticate(
+            -- Authentication can now yield while PBKDF2 runs. Protecting this
+            -- boundary lets Ctrl+T redraw login instead of escaping into init,
+            -- while unexpected backend errors receive a secret-free auth.log
+            -- record. `pcall` places the normal return values after its leading
+            -- success boolean.
+            local authSucceeded, user, resultKind, detail = pcall(
+                auth.authenticate,
                 username,
                 plainPassword
             )
@@ -141,7 +165,17 @@ while true do
             plainPassword = nil
             passwordOrError = nil
 
-            if user ~= nil then
+            if not authSucceeded then
+                username = nil
+
+                if not isTerminationError(user) then
+                    logBestEffort(
+                        "error",
+                        "Unexpected authentication backend runtime failure"
+                    )
+                    error("Authentication backend runtime failure.", 0)
+                end
+            elseif user ~= nil then
                 logBestEffort(
                     "info",
                     "Login succeeded for " .. user.name ..
@@ -149,20 +183,37 @@ while true do
                 )
                 term.setCursorBlink(false)
                 return user
-            end
-
-            if resultKind == "state" then
+            elseif resultKind == "state" then
                 logBestEffort("error", "Authentication state failure")
                 error("Authentication state failure: " .. tostring(detail), 0)
-            end
+            elseif resultKind == "backend" then
+                logBestEffort(
+                    "error",
+                    BACKEND_LOG_MESSAGES[detail] or
+                        "Authentication backend runtime failure"
+                )
+                error("Authentication backend runtime failure.", 0)
+            elseif resultKind == "denied" then
+                local rejectionMessage = REJECTION_LOG_MESSAGES[detail] or
+                    "Login rejected: credential denial"
 
-            logBestEffort("warn", "Login rejected")
-            username = nil
-            drawLogin("Login incorrect.")
-            local delaySucceeded, delayError = pcall(sleep, 0.5)
+                logBestEffort("warn", rejectionMessage)
+                username = nil
+                drawLogin("Incorrect username or password.")
+                local delaySucceeded, delayError = pcall(sleep, 0.5)
 
-            if not delaySucceeded and not isTerminationError(delayError) then
-                error("Login delay failed: " .. describeError(delayError), 0)
+                if not delaySucceeded and not isTerminationError(delayError) then
+                    error(
+                        "Login delay failed: " .. describeError(delayError),
+                        0
+                    )
+                end
+            else
+                logBestEffort(
+                    "error",
+                    "Authentication backend returned an invalid result"
+                )
+                error("Authentication backend returned an invalid result.", 0)
             end
         end
     end

@@ -185,6 +185,25 @@ end)
 assert(deniedSucceeded)
 assert(deniedState.changeCalls == 1)
 assert(string.find(deniedState.outputText, "incorrect", 1, true))
+assert(string.find(
+    table.concat(deniedState.logs, "\n"),
+    "Current password rejected",
+    1,
+    true
+))
+
+local policyState, policySucceeded = runPasswd({
+    "current password", "short", "short",
+}, function() error("changePassword must not run", 0) end)
+assert(policySucceeded)
+assert(policyState.changeCalls == 0)
+assert(string.find(policyState.outputText, "at least 8 bytes", 1, true))
+assert(string.find(
+    table.concat(policyState.logs, "\n"),
+    "Password policy rejected",
+    1,
+    true
+))
 
 local successState, successSucceeded = runPasswd({
     "current password", "new password", "new password",
@@ -214,5 +233,89 @@ local terminatedState, terminatedSucceeded, terminatedError = runPasswd({
 assert(not terminatedSucceeded)
 assert(tostring(terminatedError) == "Terminated")
 assert(terminatedState.changeCalls == 0)
+
+-- A Ctrl+T propagated by auth during PBKDF2 remains the shell-recognised
+-- termination value. passwd must not turn it into a technical failure log.
+local kdfTerminatedState, kdfTerminatedSucceeded, kdfTerminatedError =
+    runPasswd({
+        "current password", "new password", "new password",
+    }, function()
+        error("Terminated", 0)
+    end)
+assert(not kdfTerminatedSucceeded)
+assert(tostring(kdfTerminatedError) == "Terminated")
+assert(kdfTerminatedState.changeCalls == 1)
+assert(#kdfTerminatedState.logs == 0)
+
+local verifierFailureState, verifierFailureSucceeded, verifierFailureError =
+    runPasswd({
+        "current password", "new password", "new password",
+    }, function()
+        return false, "backend", "verifier_generation_failed"
+    end)
+assert(not verifierFailureSucceeded)
+assert(string.find(
+    tostring(verifierFailureError),
+    "password backend failure",
+    1,
+    true
+))
+assert(string.find(
+    table.concat(verifierFailureState.logs, "\n"),
+    "Password verifier generation failed",
+    1,
+    true
+))
+
+local writeFailureState, writeFailureSucceeded = runPasswd({
+    "current password", "new password", "new password",
+}, function()
+    return false, "write", "simulated write failure"
+end)
+assert(not writeFailureSucceeded)
+assert(string.find(
+    table.concat(writeFailureState.logs, "\n"),
+    "Password database write failed",
+    1,
+    true
+))
+
+local stateFailureState, stateFailureSucceeded = runPasswd({
+    "current password", "new password", "new password",
+}, function()
+    return false, "state", "simulated invalid database"
+end)
+assert(not stateFailureSucceeded)
+assert(string.find(
+    table.concat(stateFailureState.logs, "\n"),
+    "Authentication state invalid",
+    1,
+    true
+))
+
+-- passwd catches unexpected backend exceptions only to emit a safe phase
+-- record. Raw exception text is excluded because a future backend might copy
+-- credentials into it.
+local crashState, crashSucceeded, crashError = runPasswd({
+    "current password", "new password", "new password",
+}, function()
+    error("backend copied current password into an error", 0)
+end)
+assert(not crashSucceeded)
+assert(string.find(
+    tostring(crashError),
+    "authentication backend runtime failure",
+    1,
+    true
+))
+local crashLogs = table.concat(crashState.logs, "\n")
+assert(string.find(
+    crashLogs,
+    "Unexpected password backend runtime failure",
+    1,
+    true
+))
+assert(not string.find(crashLogs, "current password", 1, true))
+assert(not string.find(crashLogs, "new password", 1, true))
 
 io.stdout:write("auth command tests: PASS\n")

@@ -74,6 +74,26 @@ local function logBestEffort(level, message)
     end)
 end
 
+local function describeError(errorValue)
+    if type(errorValue) == "table" and
+        type(errorValue.message) == "string" then
+        return errorValue.message
+    end
+
+    return tostring(errorValue)
+end
+
+-- passwd catches unexpected auth backend crashes so it can leave one trusted,
+-- secret-free phase diagnostic in auth.log. Ctrl+T is control flow rather
+-- than a backend failure and must be re-raised for the DICK shell's existing
+-- `Command terminated.` policy.
+local function isTerminationError(errorValue)
+    local message = describeError(errorValue)
+
+    return message == "Terminated" or
+        string.match(message, ": Terminated$") ~= nil
+end
+
 -- Do not wrap these reads in pcall. Ctrl+T must become the existing shell's
 -- ordinary child-command termination, which returns to this authenticated
 -- session without writing users.db.
@@ -99,11 +119,16 @@ local passwordIsValid, validationError = password.validatePassword(newPassword)
 if not passwordIsValid then
     currentPassword = nil
     newPassword = nil
+    logBestEffort("warn", "Password policy rejected for " .. context.user)
     print(validationError)
     return
 end
 
-local changed, resultKind, detail = auth.changePassword(
+-- `pcall` protects only the trusted auth boundary. It does not make PBKDF2 or
+-- its cooperative sleeps uninterruptible: a propagated `Terminated` value is
+-- re-raised below before any failure log or user-database operation is added.
+local callSucceeded, changed, resultKind, detail = pcall(
+    auth.changePassword,
     context.user,
     currentPassword,
     newPassword,
@@ -116,6 +141,15 @@ local changed, resultKind, detail = auth.changePassword(
 currentPassword = nil
 newPassword = nil
 
+if not callSucceeded then
+    if isTerminationError(changed) then
+        error(changed, 0)
+    end
+
+    logBestEffort("error", "Unexpected password backend runtime failure")
+    error("passwd: authentication backend runtime failure.", 0)
+end
+
 if changed then
     logBestEffort("info", "Password changed for " .. context.user)
     print("Password changed.")
@@ -123,14 +157,32 @@ if changed then
 end
 
 if resultKind == "denied" then
-    logBestEffort("warn", "Password change rejected for " .. context.user)
+    logBestEffort(
+        "warn",
+        "Current password rejected for " .. context.user
+    )
     print("Current password is incorrect.")
     return
 end
 
 if resultKind == "policy" then
+    logBestEffort("warn", "Password policy rejected for " .. context.user)
     print(tostring(detail))
     return
+end
+
+if resultKind == "backend" then
+    if detail == "current_password_verification_failed" then
+        logBestEffort("error", "Current password verification backend failed")
+    elseif detail == "verifier_generation_failed" then
+        logBestEffort("error", "Password verifier generation failed")
+    elseif detail == "password_policy_evaluation_failed" then
+        logBestEffort("error", "Password policy backend failed")
+    else
+        logBestEffort("error", "Unexpected password backend runtime failure")
+    end
+
+    error("passwd: password backend failure.", 0)
 end
 
 if resultKind == "write" then
@@ -138,5 +190,5 @@ if resultKind == "write" then
     error("passwd: unable to update password database: " .. tostring(detail), 0)
 end
 
-logBestEffort("error", "Password authentication state failure")
+logBestEffort("error", "Authentication state invalid during password change")
 error("passwd: authentication state failure: " .. tostring(detail), 0)

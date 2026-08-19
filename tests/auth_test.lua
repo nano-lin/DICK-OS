@@ -22,6 +22,8 @@ local state = {
     temporaryWriteFailure = false,
     reportedSize = nil,
     readOpenFailure = false,
+    passwordYieldCallback = nil,
+    databaseTemporaryWriteCount = 0,
 }
 
 local fsMock = {}
@@ -57,6 +59,12 @@ fsMock.open = function(path, mode)
     end
 
     assert(mode == "w")
+
+    if path == USERS_PATH .. ".tmp" then
+        state.databaseTemporaryWriteCount =
+            state.databaseTemporaryWriteCount + 1
+    end
+
     state.files[path] = ""
 
     return {
@@ -118,8 +126,25 @@ environment.loadfile = function(path)
     end
 
     local source = SOURCE_BY_INSTALLED_PATH[path] or path
+    local program, loadError = hostLoadfile(source, "t", environment)
 
-    return hostLoadfile(source, "t", environment)
+    if program == nil then
+        return nil, loadError
+    end
+
+    -- A freshly loaded auth/users module receives its own password-module
+    -- instance. Wrapping only that installed path lets a scenario inject the
+    -- private cooperative-yield callback without changing production APIs.
+    if path == "/dickos/lib/password.lua" and
+        state.passwordYieldCallback ~= nil then
+        local callback = state.passwordYieldCallback
+
+        return function()
+            return program({ cooperativeYield = callback })
+        end
+    end
+
+    return program
 end
 
 local password = assert(environment.loadfile(
@@ -323,6 +348,10 @@ assert(unknownField == nil)
 assert(contains(unknownFieldError, "unknown field"))
 state.files[USERS_PATH] = originalDatabaseText
 
+local cooperativeYieldCount = 0
+state.passwordYieldCallback = function()
+    cooperativeYieldCount = cooperativeYieldCount + 1
+end
 local auth = assert(environment.loadfile("/dickos/lib/auth.lua"))()
 assert(auth.validateState())
 
@@ -334,12 +363,18 @@ assert(authenticated.admin)
 assert(authenticated.home == "/dickos/home/nano")
 assert(authenticated.verifier == nil)
 
-local unknownUser, unknownKind = auth.authenticate("nobody", "initial password")
+local unknownUser, unknownKind, unknownReason =
+    auth.authenticate("nobody", "initial password")
 assert(unknownUser == nil and unknownKind == "denied")
-local wrongPassword, wrongKind = auth.authenticate("nano", "wrong password")
+assert(unknownReason == "unknown_user")
+local wrongPassword, wrongKind, wrongReason =
+    auth.authenticate("nano", "wrong password")
 assert(wrongPassword == nil and wrongKind == "denied")
-local rootLogin, rootKind = auth.authenticate("root", "initial password")
+assert(wrongReason == "incorrect_password")
+local rootLogin, rootKind, rootReason =
+    auth.authenticate("root", "initial password")
 assert(rootLogin == nil and rootKind == "denied")
+assert(rootReason == "direct_login_disabled")
 
 state.files[USERS_PATH] = string.gsub(
     originalDatabaseText,
@@ -359,6 +394,7 @@ local wrongChange, wrongChangeKind = auth.changePassword(
 assert(not wrongChange and wrongChangeKind == "denied")
 assert(state.files[USERS_PATH] == originalDatabaseText)
 
+local yieldsBeforeSuccessfulChange = cooperativeYieldCount
 local changed, changeKind, changeError = auth.changePassword(
     "nano",
     "initial password",
@@ -366,6 +402,10 @@ local changed, changeKind, changeError = auth.changePassword(
     "machine"
 )
 assert(changed, tostring(changeKind) .. ": " .. tostring(changeError))
+-- The successful path verifies the 1000-round old verifier and creates the
+-- production 4096-round replacement. Both phases crossed cooperative yield
+-- points, so they were not one uninterrupted double-KDF computation.
+assert(cooperativeYieldCount - yieldsBeforeSuccessfulChange == 19)
 assert(state.files[USERS_PATH] ~= originalDatabaseText)
 assert(not contains(state.files[USERS_PATH], "replacement password"))
 local changedDatabase = assert(users.load())
@@ -387,6 +427,72 @@ state.failReplacementMove = false
 assert(not failedWrite and failedWriteKind == "write")
 assert(state.files[USERS_PATH] == beforeFailedWrite)
 assert(auth.authenticate("nano", "replacement password"))
+
+-- Ctrl+T from an injected PBKDF2 yield propagates instead of becoming a wrong
+-- password or backend result. Since replacement construction never completed,
+-- users.write was never reached and the database remains byte-for-byte equal.
+local beforeInterruptedChange = state.files[USERS_PATH]
+local writesBeforeInterruptedChange = state.databaseTemporaryWriteCount
+state.passwordYieldCallback = function()
+    error("Terminated", 0)
+end
+local interruptedAuth = assert(environment.loadfile(
+    "/dickos/lib/auth.lua"
+))()
+state.passwordYieldCallback = nil
+local interrupted, interruptionError = pcall(
+    interruptedAuth.changePassword,
+    "nano",
+    "replacement password",
+    "interrupted password",
+    "machine"
+)
+assert(not interrupted)
+assert(tostring(interruptionError) == "Terminated")
+assert(state.files[USERS_PATH] == beforeInterruptedChange)
+assert(state.databaseTemporaryWriteCount == writesBeforeInterruptedChange)
+
+-- A non-termination backend crash receives a safe phase code rather than an
+-- ordinary credential denial. The raw backend error is deliberately absent.
+state.passwordYieldCallback = function()
+    error("simulated backend crash with secret-like text", 0)
+end
+local crashingAuth = assert(environment.loadfile("/dickos/lib/auth.lua"))()
+state.passwordYieldCallback = nil
+local backendUser, backendKind, backendReason = crashingAuth.authenticate(
+    "nano",
+    "replacement password"
+)
+assert(backendUser == nil and backendKind == "backend")
+assert(backendReason == "login_password_verification_failed")
+assert(not contains(backendReason, "secret-like"))
+
+-- Allow the old-password verification yields, then fail at the first yield of
+-- new-verifier generation. This distinguishes the two expensive phases and
+-- again proves that users.db is unchanged before the transaction.
+local verifierPhaseYields = 0
+state.passwordYieldCallback = function()
+    verifierPhaseYields = verifierPhaseYields + 1
+
+    if verifierPhaseYields == 17 then
+        error("simulated verifier backend crash", 0)
+    end
+end
+local verifierFailureAuth = assert(environment.loadfile(
+    "/dickos/lib/auth.lua"
+))()
+state.passwordYieldCallback = nil
+local verifierFailed, verifierFailureKind, verifierFailureReason =
+    verifierFailureAuth.changePassword(
+        "nano",
+        "replacement password",
+        "another replacement",
+        "machine"
+    )
+assert(not verifierFailed and verifierFailureKind == "backend")
+assert(verifierFailureReason == "verifier_generation_failed")
+assert(state.files[USERS_PATH] == beforeInterruptedChange)
+assert(state.databaseTemporaryWriteCount == writesBeforeInterruptedChange)
 
 state.files[USERS_PATH] = nil
 local stateUser, stateKind = auth.authenticate("nano", "replacement password")

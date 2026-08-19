@@ -19,6 +19,24 @@ local password = {
     maximumPasswordBytes = 128,
 }
 
+-- A top-level Lua chunk receives values passed by its caller through `...`.
+-- Normal DICK/OS callers pass nothing. Host-side tests may pass a table with a
+-- `cooperativeYield` callback so the scheduling path can be exercised even
+-- though ordinary desktop Lua does not provide CC:T's global `sleep` API.
+-- The callback remains private to this module instance; it is not a password
+-- API and cannot change the bytes processed by PBKDF2.
+local moduleOptions = ...
+local injectedCooperativeYield = nil
+
+if moduleOptions ~= nil then
+    assert(type(moduleOptions) == "table",
+        "Password module options must be a table")
+    assert(moduleOptions.cooperativeYield == nil or
+        type(moduleOptions.cooperativeYield) == "function",
+        "Password cooperative yield option must be a function")
+    injectedCooperativeYield = moduleOptions.cooperativeYield
+end
+
 local band = assert(bit32 and bit32.band, "bit32.band is required")
 local bor = assert(bit32 and bit32.bor, "bit32.bor is required")
 local bxor = assert(bit32 and bit32.bxor, "bit32.bxor is required")
@@ -28,6 +46,7 @@ local rrotate = assert(bit32 and bit32.rrotate, "bit32.rrotate is required")
 
 local UINT32 = 4294967296
 local SHA256_BLOCK_BYTES = 64
+local PBKDF2_ROUNDS_PER_YIELD = 256
 local saltCounter = 0
 
 local SHA256_INITIAL = {
@@ -252,6 +271,30 @@ local function hmacSHA256Raw(key, message)
     )
 end
 
+-- Give CC:T's cooperative scheduler control after a bounded amount of KDF
+-- work. `sleep(0)` is a documented public CC:T API: CC:T rounds the delay up
+-- to one server tick, so yielding too often would add visible runtime cost.
+-- One yield per 256 PBKDF2 rounds reduces each uninterrupted pure-Lua batch to
+-- one sixteenth of a production verifier and adds only 16 scheduler points to
+-- its 4096 rounds. The exact runtime margin still requires Minecraft testing.
+--
+-- Desktop Lua has no global `sleep`, so host crypto tests simply continue. A
+-- test may inject the callback above to prove the yield path is used. Neither
+-- path is protected with `pcall`: if CC:T raises `Terminated` while sleeping,
+-- it must propagate to the DICK shell as an ordinary Ctrl+T child termination.
+-- Yielding is only runtime scheduling; it is not part of PBKDF2 and provides no
+-- additional cryptographic protection.
+local function cooperativeYield()
+    if injectedCooperativeYield ~= nil then
+        injectedCooperativeYield()
+        return
+    end
+
+    if type(sleep) == "function" then
+        sleep(0)
+    end
+end
+
 -- PBKDF2 generates successive blocks U1, U2, ... and XORs every U in a block.
 -- Iterations are validated here too so malformed direct calls cannot create an
 -- accidental unbounded loop. `derivedBytes` is capped because DICK/OS password
@@ -277,10 +320,17 @@ local function pbkdf2Raw(plainPassword, salt, iterations, derivedBytes)
             salt .. wordToBytes(blockIndex)
         )
         local accumulated = u
+        local roundsSinceYield = 1
 
         for _ = 2, iterations do
             u = hmacSHA256Raw(plainPassword, u)
             accumulated = xorBytes(accumulated, u)
+            roundsSinceYield = roundsSinceYield + 1
+
+            if roundsSinceYield >= PBKDF2_ROUNDS_PER_YIELD then
+                cooperativeYield()
+                roundsSinceYield = 0
+            end
         end
 
         derivedBlocks[#derivedBlocks + 1] = accumulated

@@ -823,27 +823,16 @@ if not animateBootProgress(bootCosmeticDelay) then
     return STAGE0_RESTART_RESULT
 end
 
--- Init adds persistent installation metadata to Stage-0's runtime-only Boot ID
--- and passes one explicit presentation interface to dickfetch. The table is
--- not saved and is intentionally smaller than a general session-state object.
+-- Init combines persistent installation metadata with Stage-0's runtime-only
+-- Boot ID for the post-authentication presentation. Constructing this table
+-- does not display anything: the session loop invokes dickfetch only after
+-- credentials have been accepted. The table is never saved.
 local dickfetchContext = {
     version = version,
     hostname = hostname,
     machineID = machineID,
     bootID = bootID,
 }
-logBestEffort(bootLogger, "info", "init", "dickfetch starting")
-local presentationSucceeded, presentationError = runDickfetch(dickfetchContext)
-
-if not presentationSucceeded then
-    logBestEffort(
-        bootLogger,
-        "warn",
-        "dickfetch",
-        "Presentation failure: " .. tostring(presentationError)
-    )
-    drawDickfetchFallback(dickfetchContext, presentationError)
-end
 
 logBestEffort(bootLogger, "info", "init", "Login service ready")
 logBestEffort(systemLogger, "info", "init", "Login service ready")
@@ -858,7 +847,9 @@ local loginContext = {
 
 -- Init owns the session loop. Logout returns here without rebooting, then the
 -- same login context begins another authentication attempt under the same
--- Stage-0 Boot ID. Any other shell/login return remains a core failure.
+-- Stage-0 Boot ID. Every successful authentication gets a fresh dickfetch
+-- presentation before its shell; no presentation runs before credentials.
+-- Any other shell/login return remains a core failure.
 while true do
     logBestEffort(bootLogger, "info", "login", "DICK login starting")
     local authenticatedUser, loginError = runLogin(loginContext)
@@ -867,6 +858,25 @@ while true do
         logBestEffort(bootLogger, "error", "login", loginError)
         logBestEffort(systemLogger, "error", "login", loginError)
         error(loginError, 0)
+    end
+
+    -- login owns and clears its credential screen. Reset normal terminal state
+    -- after it returns, then run the noncritical presentation. A broken
+    -- dickfetch still receives the existing minimal fallback before the
+    -- authenticated shell starts.
+    prepareTerminal()
+    logBestEffort(bootLogger, "info", "init", "dickfetch starting")
+    local presentationSucceeded, presentationError =
+        runDickfetch(dickfetchContext)
+
+    if not presentationSucceeded then
+        logBestEffort(
+            bootLogger,
+            "warn",
+            "dickfetch",
+            "Presentation failure: " .. tostring(presentationError)
+        )
+        drawDickfetchFallback(dickfetchContext, presentationError)
     end
 
     local shellContext = {

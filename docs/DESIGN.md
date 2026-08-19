@@ -826,8 +826,8 @@ The current implemented handoff is:
 
 ```text
 init -> persistent system configuration -> authentication core/users.db
-     -> boot presentation -> dickfetch -> login
-     -> authenticated /dickos/system/shell.lua
+     -> boot presentation -> login -> successful authentication
+     -> dickfetch -> authenticated /dickos/system/shell.lua
 ```
 
 Init combines Stage-0's runtime API version and Boot ID with the installed
@@ -839,11 +839,14 @@ session table; parsed configuration, users.db, verifiers, passwords, and auth
 modules are not forwarded. Boot ID is never written to disk.
 
 Init owns the session loop. The shell may return only `logout`; init records
-that transition best-effort and starts login again with the same Boot ID. A
-missing/broken auth dependency, invalid users.db, missing/crashing login, or
-missing/crashing/unexpectedly returning shell is an init failure and reaches
-Stage-0 Recovery. This core contract remains separate from optional config-data
-fallback and the shell's protected child-command boundary.
+that transition best-effort and starts login again with the same Boot ID. Each
+successful login clears/prepares the normal terminal, runs dickfetch, and then
+starts a new authenticated shell. No dickfetch presentation is shown before
+credentials are accepted. A missing/broken auth dependency, invalid users.db,
+missing/crashing login, or missing/crashing/unexpectedly returning shell is an
+init failure and reaches Stage-0 Recovery. This core contract remains separate
+from optional config-data fallback and the shell's protected child-command
+boundary.
 
 ---
 
@@ -886,24 +889,24 @@ generic boot framework. User database/auth core now describes real validation;
 integrity, services, drivers, dickd, DickNet, and package management must not
 appear as successful stages until those subsystems exist.
 
-After progress completes, init clears the framed boot screen and invokes
-`/dickos/bin/dickfetch.lua`. Dickfetch is the canonical compact post-boot
-system-information presentation: the happy DICK/OS mascot begins at the same
-vertical level as the title, followed in order by version, hostname, machine
-ID, runtime Boot ID, and green `SYSTEM READY` state. It has no giant frame,
-underline, or bootstrap-placeholder text.
+After progress completes, init clears the framed boot screen and starts the
+native login UI. Only after successful authentication does init clear/prepare
+the terminal and invoke `/dickos/bin/dickfetch.lua`. Dickfetch is the canonical
+compact post-login system-information presentation: the happy DICK/OS mascot
+begins at the same vertical level as the title, followed in order by version,
+hostname, machine ID, runtime Boot ID, and green `SYSTEM READY` state. It has no
+giant frame, underline, or bootstrap-placeholder text.
 
 Init passes dickfetch one explicit table containing `version`, `hostname`,
 `machineID`, and `bootID`. The utility does not persist Boot ID or reconstruct
 it from the filesystem. Missing required metadata remains an init failure,
 while a missing, invalid, or crashing dickfetch is a noncritical presentation
-failure: init displays a minimal identity/status fallback rather than entering
-Recovery.
-
-After either successful dickfetch or that fallback, init starts the native
-login screen. Successful authentication starts the DICK shell in the account's
-home. The user may run `dickfetch` again explicitly like any other
-`/dickos/bin` utility.
+failure: after authentication, init displays a minimal identity/status fallback
+and still starts the DICK shell in the account's home rather than entering
+Recovery. Logout returns to login; the next successful authentication runs
+dickfetch again before the new shell while retaining the same runtime Boot ID.
+The user may also run `dickfetch` explicitly like any other `/dickos/bin`
+utility.
 
 ---
 
@@ -1098,6 +1101,15 @@ digest     = 32 derived bytes encoded as lowercase hex
 
 The production iteration count is central, with stored counts accepted only
 from 1000 through 100000 to prevent damaged data from requesting absurd work.
+Pure-Lua PBKDF2 yields cooperatively after each batch of 256 KDF rounds. On
+CC:T this uses the public interruptible `sleep(0)` API, which rounds up to one
+server tick; the batch therefore balances watchdog compliance against visible
+scheduling overhead. Desktop-Lua tests inject an equivalent callback because
+they do not provide CC:T's global `sleep`. These yield points are a CC:T runtime
+and scheduling requirement only: they do not change PBKDF2 output and do not
+improve password security. The initial batch size and complete successful
+`passwd` timing still require Minecraft runtime verification.
+
 Every new verifier receives a best-effort unique salt derived from changing
 CC:T runtime/machine inputs. Salt is not secret, and CC:T is not claimed to
 provide a cryptographically secure RNG. Digest comparison examines every byte
@@ -1117,10 +1129,14 @@ change. It distinguishes ordinary denial from broken state and transactional
 write failure. Only public name/UID/home/admin identity crosses into a session.
 
 `/dickos/system/login.lua` is a black native UI showing DICK/OS, hostname, and
-masked credentials. Unknown user, wrong password, and disabled root login all
-display only `Login incorrect.` and loop. Ctrl+T is contained and redraws login
-without becoming a failed attempt. A broken auth state or login module is a
-core init failure and therefore Recovery.
+masked credentials. Unknown user, wrong password, disabled root login, and any
+ordinary credential denial all display only
+`Incorrect username or password.` and loop. Trusted auth.log records
+distinguish the secret-free categories `unknown user`, `incorrect password`,
+and `direct login disabled`; the UI never discloses which category occurred.
+Ctrl+T during input or an interruptible PBKDF2 yield is contained and redraws
+login without becoming a failed attempt. A broken auth state or login module is
+a core init failure and therefore Recovery.
 
 `logout` returns from the shell to init and starts login again without reboot,
 preserving Boot ID. `whoami`, `id`, and current-user-only `passwd` are native
@@ -1944,9 +1960,12 @@ load/runtime failures. Shell records include the resolved command name but
 deliberately omit the complete raw argument line so future secrets are not
 blindly copied into logs. Reboot and shutdown requests are also logged
 best-effort before invoking the real power API. `auth.log` records successful
-login/logout/password changes, rejected login/password-change attempts at
-WARN, and authentication state/write failures. It never records passwords,
-password lengths, salts, digests, complete users.db contents, or raw commands.
+login/logout/password changes, secret-free login rejection categories and
+password-change rejections at WARN, plus phase-specific authentication-state,
+password-backend, verifier-generation, and users.db write failures. Unexpected
+backend exception text is not copied when it might contain credential material.
+The log never records passwords, password lengths, salts, digests, complete
+users.db contents, or raw commands.
 
 All files are bounded before appending a record which would cross their limit:
 
@@ -2101,6 +2120,9 @@ integrity
     |
     v
 login
+    |
+    v
+dickfetch
     |
     v
 DICK shell

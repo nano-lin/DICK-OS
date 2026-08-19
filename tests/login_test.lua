@@ -101,13 +101,14 @@ end
 
 local attempts = 0
 local rejectedState, rejectedSucceeded, rejectedUser = runScenario({
-    "nobody", "wrong password",
-    "root", "wrong password",
-    "nano", "correct password",
+    "nobody", "unknown credential input",
+    "root", "disabled credential input",
+    "nano", "bad credential input",
+    "nano", "accepted credential input",
 }, function(username, plainPassword)
     attempts = attempts + 1
 
-    if username == "nano" and plainPassword == "correct password" then
+    if username == "nano" and plainPassword == "accepted credential input" then
         return {
             name = "nano",
             uid = 1000,
@@ -116,15 +117,40 @@ local rejectedState, rejectedSucceeded, rejectedUser = runScenario({
         }
     end
 
-    return nil, "denied", nil
+    if username == "nobody" then
+        return nil, "denied", "unknown_user"
+    end
+
+    if username == "root" then
+        return nil, "denied", "direct_login_disabled"
+    end
+
+    return nil, "denied", "incorrect_password"
 end)
 assert(rejectedSucceeded)
 assert(rejectedUser.name == "nano")
 assert(rejectedUser.verifier == nil)
-assert(attempts == 3)
-assert(rejectedState.maskedReads == 3)
-assert(contains(rejectedState.outputText, "Login incorrect."))
-assert(contains(table.concat(rejectedState.logs, "\n"), "Login rejected"))
+assert(attempts == 4)
+assert(rejectedState.maskedReads == 4)
+assert(contains(
+    rejectedState.outputText,
+    "Incorrect username or password."
+))
+assert(not contains(rejectedState.outputText, "Login incorrect."))
+local _, genericNoticeCount = string.gsub(
+    rejectedState.outputText,
+    "Incorrect username or password%.",
+    ""
+)
+assert(genericNoticeCount == 3)
+local rejectionLogs = table.concat(rejectedState.logs, "\n")
+assert(contains(rejectionLogs, "Login rejected: unknown user"))
+assert(contains(rejectionLogs, "Login rejected: incorrect password"))
+assert(contains(rejectionLogs, "Login rejected: direct login disabled"))
+assert(not contains(rejectionLogs, "unknown credential input"))
+assert(not contains(rejectionLogs, "disabled credential input"))
+assert(not contains(rejectionLogs, "bad credential input"))
+assert(not contains(rejectionLogs, "accepted credential input"))
 
 local terminatedState, terminatedSucceeded, terminatedUser = runScenario({
     { error = "Terminated" },
@@ -142,6 +168,35 @@ assert(terminatedSucceeded)
 assert(terminatedUser.name == "nano")
 assert(terminatedState.maskedReads == 1)
 
+-- PBKDF2 now yields during authentication. A Ctrl+T propagated from that
+-- phase redraws login and is not logged as a rejected credential attempt.
+local authenticationCalls = 0
+local kdfTerminatedState, kdfTerminatedSucceeded, kdfTerminatedUser =
+    runScenario({
+        "nano", "first password",
+        "nano", "correct password",
+    }, function()
+        authenticationCalls = authenticationCalls + 1
+
+        if authenticationCalls == 1 then
+            error("Terminated", 0)
+        end
+
+        return {
+            name = "nano",
+            uid = 1000,
+            home = "/dickos/home/nano",
+            admin = true,
+        }
+    end)
+assert(kdfTerminatedSucceeded)
+assert(kdfTerminatedUser.name == "nano")
+assert(kdfTerminatedState.maskedReads == 2)
+assert(not contains(
+    table.concat(kdfTerminatedState.logs, "\n"),
+    "Login rejected"
+))
+
 local stateFailure, stateSucceeded, stateError = runScenario({
     "nano", "correct password",
 }, function()
@@ -150,5 +205,33 @@ end)
 assert(not stateSucceeded)
 assert(contains(stateError, "Authentication state failure"))
 assert(not contains(stateError, "correct password"))
+
+local backendFailure, backendSucceeded, backendError = runScenario({
+    "nano", "private password",
+}, function()
+    error("backend diagnostic containing private password", 0)
+end)
+assert(not backendSucceeded)
+assert(contains(backendError, "Authentication backend runtime failure"))
+local backendLogs = table.concat(backendFailure.logs, "\n")
+assert(contains(
+    backendLogs,
+    "Unexpected authentication backend runtime failure"
+))
+assert(not contains(backendLogs, "private password"))
+
+local classifiedBackend, classifiedSucceeded, classifiedError = runScenario({
+    "nano", "another private password",
+}, function()
+    return nil, "backend", "login_password_verification_failed"
+end)
+assert(not classifiedSucceeded)
+assert(contains(classifiedError, "Authentication backend runtime failure"))
+local classifiedLogs = table.concat(classifiedBackend.logs, "\n")
+assert(contains(
+    classifiedLogs,
+    "Login password verification backend failed"
+))
+assert(not contains(classifiedLogs, "another private password"))
 
 io.stdout:write("login tests: PASS\n")
