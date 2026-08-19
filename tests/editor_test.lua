@@ -674,6 +674,53 @@ assert(criticalSaveSucceeded, tostring(criticalSaveFailure))
 assert(criticalSaveState.confirmationReads == 1)
 assert(criticalSaveState.files["/startup.lua"] == "xboot")
 
+-- Exact `/startup` and every descendant are CraftOS startup paths. Normal
+-- editing is denied before the full-screen UI, while an elevated invocation
+-- must type the particular target before even a missing document is opened.
+for _, startupPath in ipairs({ "/startup", "/startup/test.lua" }) do
+    local deniedState, deniedSucceeded, deniedFailure = runEditor({
+        requestedPath = startupPath,
+    })
+    assert(not deniedSucceeded)
+    assertContains(deniedFailure, "use sudo")
+    assert(deniedState.confirmationReads == 0)
+    assert(#deniedState.frames == 0)
+    assert(#deniedState.writePaths == 0)
+
+    local wrongState, wrongSucceeded, wrongFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = startupPath,
+        confirmations = { startupPath .. "-wrong" },
+    })
+    assert(wrongSucceeded, tostring(wrongFailure))
+    assert(wrongState.confirmationReads == 1)
+    assert(#wrongState.frames == 0)
+    assert(#wrongState.writePaths == 0)
+    assert(wrongState.files[startupPath] == nil)
+
+    local terminatedState, terminatedSucceeded, terminatedFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = startupPath,
+        confirmations = { { error = "Terminated" } },
+    })
+    assert(terminatedSucceeded, tostring(terminatedFailure))
+    assert(terminatedState.confirmationReads == 1)
+    assert(#terminatedState.frames == 0)
+    assert(#terminatedState.writePaths == 0)
+    assert(terminatedState.files[startupPath] == nil)
+
+    local openedState, openedSucceeded, openedFailure = runEditor({
+        context = elevatedEditorContext,
+        requestedPath = startupPath,
+        confirmations = { startupPath },
+        events = cleanQuitEvents(),
+    })
+    assert(openedSucceeded, tostring(openedFailure))
+    assert(openedState.confirmationReads == 1)
+    assert(#openedState.frames > 0)
+    assert(#openedState.writePaths == 0)
+end
+
 local homeState, homeSucceeded, homeFailure = runEditor({
     requestedPath = "~",
     directories = { ["/dickos/home/bootstrap"] = true },

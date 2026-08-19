@@ -331,20 +331,20 @@ assert(#cacheState.childCalls == 3)
 local cachedCriticalState = runScenario({
     lines = {
         "sudo probe establish-cache",
-        "sudo touch /startup.lua",
+        "sudo touch /startup",
         "logout",
     },
     passwords = { "correct password" },
-    confirmations = { "/startup.lua" },
+    confirmations = { "/startup" },
 })
 assert(cachedCriticalState.authCalls == 1)
 assert(cachedCriticalState.passwordReads == 1)
 assert(cachedCriticalState.confirmationReads == 1)
-assert(cachedCriticalState.files["/startup.lua"] == "")
+assert(cachedCriticalState.files["/startup"] == "")
 local sawCriticalConfirmation = false
 for _, record in ipairs(cachedCriticalState.logs) do
     if record.target == "system" and
-        record.message == "Critical mutation confirmed: touch /startup.lua" then
+        record.message == "Critical mutation confirmed: touch /startup" then
         sawCriticalConfirmation = true
     end
 end

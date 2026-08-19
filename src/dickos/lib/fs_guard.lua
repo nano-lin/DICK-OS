@@ -9,6 +9,7 @@ local guard = {}
 
 local DICK_ROOT = "/dickos"
 local TEMPORARY_ROOT = "/dickos/tmp"
+local CRAFTOS_STARTUP_ROOT = "/startup"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 
 local CRITICAL_EXACT_PATHS = {
@@ -146,7 +147,12 @@ local function classifyNormalised(path, operation, context)
         return "catastrophic"
     end
 
+    -- CraftOS treats exact `/startup` as either an extensionless startup file
+    -- or a directory whose programs participate in local startup. Classifying
+    -- it as a namespace protects both forms and every possible program below
+    -- the directory. `isWithin` keeps similarly named neighbours ordinary.
     if CRITICAL_EXACT_PATHS[path] or
+        guard.isWithin(path, CRAFTOS_STARTUP_ROOT) or
         guard.isWithin(path, "/dickos/system") or
         guard.isWithin(path, "/dickos/lib") then
         return "critical"
@@ -267,6 +273,15 @@ local function warningLines(inspection)
         }
     end
 
+    if guard.isWithin(path, CRAFTOS_STARTUP_ROOT) then
+        return {
+            "CraftOS may execute an extensionless /startup file.",
+            "It may also execute programs inside a /startup directory.",
+            "Changing this path can interfere with DICK/OS startup or rescue.",
+            "Manual CraftOS repair may be required.",
+        }
+    end
+
     if path == "/.settings" then
         return {
             "Changing this file can alter CraftOS startup policy.",
@@ -293,6 +308,21 @@ local function warningLines(inspection)
         "Changing required system identity metadata can make init fail.",
         "Recovery may be required.",
     }
+end
+
+local function warningHeading(inspection)
+    if inspection.risk == "catastrophic" then
+        return "DANGER: CATASTROPHIC FILESYSTEM OPERATION"
+    end
+
+    -- Keep CraftOS's alternate startup namespace visually distinct from the
+    -- Stage-0 `/startup.lua` warning: both are critical, but they participate
+    -- in different parts of the platform's local startup sequence.
+    if guard.isWithin(inspection.path, CRAFTOS_STARTUP_ROOT) then
+        return "DANGER: CRITICAL CRAFTOS STARTUP PATH"
+    end
+
+    return "DANGER: CRITICAL DICK/OS PATH"
 end
 
 -- Confirmation logging is best-effort and deliberately restricted to paths
@@ -333,13 +363,8 @@ function guard.confirm(inspections, operationName, context)
             not confirmedPaths[inspection.path] then
             confirmedPaths[inspection.path] = true
 
-            if inspection.risk == "catastrophic" then
-                setTextColorBestEffort(colors and colors.red)
-                print("DANGER: CATASTROPHIC FILESYSTEM OPERATION")
-            else
-                setTextColorBestEffort(colors and colors.red)
-                print("DANGER: CRITICAL DICK/OS PATH")
-            end
+            setTextColorBestEffort(colors and colors.red)
+            print(warningHeading(inspection))
 
             setTextColorBestEffort(colors and colors.white)
             print("Operation: " .. displayedOperation)

@@ -745,6 +745,14 @@ damaged so severely that CraftOS cannot execute it. This is an unavoidable
 limit of running on top of CraftOS's standard startup mechanism, not a recovery
 case which already-running DICK/OS code can intercept.
 
+CraftOS's local startup namespace also includes exact `/startup`. That path may
+be an extensionless startup file or a directory whose programs run after
+`/startup.lua`. Consequently `/startup`, every path below a `/startup`
+directory, and `/startup.lua` are all external boot-critical paths: changing
+them can interfere with normal DICK/OS startup or with the explicit CraftOS
+rescue transition. The `/startup` boundary is component-aware, so neighbours
+such as `/startup-old`, `/startup_backup`, and `/startups` are unrelated paths.
+
 ---
 
 # 14. Ctrl+T behaviour
@@ -1314,9 +1322,10 @@ child of `/dickos/system` and `/dickos/home/nano-old` is not nano's home.
 Mutation risk classes are:
 
 - ordinary: the real user's home subtree, `/dickos/tmp`, and paths outside
-  `/dickos` except the two platform files listed below;
+  `/dickos` except the platform startup/settings paths listed below;
 - protected: all other `/dickos` paths, including another user's home;
-- critical: `/startup.lua`, `/.settings`, `/dickos/system/**`,
+- critical: `/startup.lua`, exact `/startup` and every `/startup/**` descendant,
+  `/.settings`, `/dickos/system/**`,
   `/dickos/lib/**`, and exact `/dickos/etc/users.db`, `version`, `hostname`,
   and `machine-id` metadata files;
 - catastrophic: destructive remove/move of `/` or `/dickos` itself.
@@ -1330,12 +1339,15 @@ wrong, or Ctrl+T input cancels before mutation. The confirmation is required
 even when sudo's 120-second authentication cache is valid.
 
 The shared prompt names the operation and target and explains the relevant
-failure mode: Stage-0/automatic Recovery for `/startup.lua`, CraftOS startup
-policy for `/.settings`, boot/Recovery for core code, login failure for
-`users.db`, init metadata failure for identity files, and installation or
-filesystem destruction for catastrophic roots. It warns that manual
-Recovery/CraftOS repair may be required without calling ordinary mistakes
-permanently irreparable.
+failure mode: Stage-0/automatic Recovery for `/startup.lua`; execution of an
+extensionless file or directory programs for the `/startup` namespace;
+CraftOS startup policy for `/.settings`; boot/Recovery for core code; login
+failure for `users.db`; init metadata failure for identity files; and
+installation or filesystem destruction for catastrophic roots. It warns that
+manual Recovery/CraftOS repair may be required without calling ordinary
+mistakes permanently irreparable. `/startup` containment requires either an
+exact match or a following slash, so `/startup-old`, `/startup_backup`, and
+`/startups` remain ordinary external paths.
 
 All mutating commands use two phases. First they parse every argument, resolve
 actual destination semantics, inspect filesystem types/parents, classify every

@@ -660,6 +660,85 @@ local forgedState, forgedSucceeded = runCommand(
 assert(not forgedSucceeded)
 assert(forgedState.mutationCount == 0)
 
+-- Every native mutation command reaches the same central `/startup` policy.
+-- These denials deliberately exercise each command's real destination/source
+-- planning and prove that phase two never begins for an ordinary invocation.
+local startupCommandCases = {
+    {
+        command = "touch",
+        arguments = { "/startup" },
+    },
+    {
+        command = "mkdir",
+        arguments = { "/startup" },
+    },
+    {
+        command = "mkdir",
+        arguments = { "-p", "/startup/test" },
+    },
+    {
+        command = "cp",
+        arguments = { "source.txt", "/startup" },
+        options = {
+            files = {
+                ["/dickos/home/nano/work/source.txt"] = "source",
+            },
+        },
+    },
+    {
+        command = "mv",
+        arguments = { "source.txt", "/startup" },
+        options = {
+            files = {
+                ["/dickos/home/nano/work/source.txt"] = "source",
+            },
+        },
+    },
+    {
+        command = "rm",
+        arguments = { "/startup" },
+        options = { files = { ["/startup"] = "boot" } },
+    },
+}
+
+for _, case in ipairs(startupCommandCases) do
+    local state, succeeded, failure = runCommand(
+        case.command,
+        normalContext,
+        case.arguments,
+        case.options
+    )
+    assert(not succeeded, case.command)
+    assert(contains(failure, "use sudo"), case.command)
+    assert(state.mutationCount == 0, case.command)
+end
+
+local wrongStartupWriteState, wrongStartupWriteSucceeded = runCommand(
+    "touch",
+    elevatedContext,
+    { "/startup/test.lua" },
+    {
+        directories = { ["/startup"] = true },
+        confirmations = { "/startup/wrong.lua" },
+    }
+)
+assert(wrongStartupWriteSucceeded)
+assert(wrongStartupWriteState.mutationCount == 0)
+assert(wrongStartupWriteState.files["/startup/test.lua"] == nil)
+
+local confirmedStartupWriteState, confirmedStartupWriteSucceeded = runCommand(
+    "touch",
+    elevatedContext,
+    { "/startup/test.lua" },
+    {
+        directories = { ["/startup"] = true },
+        confirmations = { "/startup/test.lua" },
+    }
+)
+assert(confirmedStartupWriteSucceeded)
+assert(confirmedStartupWriteState.mutationCount == 1)
+assert(confirmedStartupWriteState.files["/startup/test.lua"] == "")
+
 for _, commandName in ipairs({ "touch", "mkdir", "cp", "mv", "rm" }) do
     local helpState, helpSucceeded = runCommand(
         commandName,

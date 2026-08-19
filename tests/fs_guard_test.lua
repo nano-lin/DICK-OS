@@ -68,6 +68,11 @@ assert(guard.isWithin("/dickos/system", "/dickos/system"))
 assert(guard.isWithin("/dickos/system/init.lua", "/dickos/system"))
 assert(not guard.isWithin("/dickos/systematic", "/dickos/system"))
 assert(not guard.isWithin("/dickos/home/nano-old", normal.home))
+assert(guard.isWithin("/startup", "/startup"))
+assert(guard.isWithin("/startup/test.lua", "/startup"))
+assert(not guard.isWithin("/startup-old", "/startup"))
+assert(not guard.isWithin("/startup_backup", "/startup"))
+assert(not guard.isWithin("/startups", "/startup"))
 
 local function risk(path, operation, context)
     return assert(guard.inspect(path, operation or "write", context or normal)).risk
@@ -94,6 +99,12 @@ end
 assert(risk("/dickos/system/init.lua") == "critical")
 assert(risk("/dickos/systematic/file") == "protected")
 assert(risk("/dickos/lib/fs_guard.lua") == "critical")
+assert(risk("/startup") == "critical")
+assert(risk("/startup/test.lua") == "critical")
+assert(risk("/startup/nested/test.lua") == "critical")
+assert(risk("/startup-old") == "ordinary")
+assert(risk("/startup_backup") == "ordinary")
+assert(risk("/startups") == "ordinary")
 
 for _, path in ipairs({
     "/startup.lua",
@@ -183,6 +194,52 @@ inputIndex = 0
 local terminatedConfirmation, terminatedReason =
     guard.confirm({ criticalInspection }, "rm", elevated)
 assert(not terminatedConfirmation and terminatedReason == "cancelled")
+
+-- CraftOS's alternate startup path is a complete namespace: exact `/startup`
+-- may be an extensionless program, while descendants may be programs in a
+-- startup directory. Each target still requires its own exact answer.
+local function assertStartupNamespaceConfirmation(path)
+    local inspection = assert(guard.inspect(path, "write", elevated))
+    assert(inspection.risk == "critical")
+    assert(guard.authorize({ inspection }, elevated))
+
+    output = {}
+    inputs = { path }
+    inputIndex = 0
+    assert(guard.confirm({ inspection }, "edit", elevated))
+    local confirmationOutput = table.concat(output, "\n")
+    assert(string.find(
+        confirmationOutput,
+        "DANGER: CRITICAL CRAFTOS STARTUP PATH",
+        1,
+        true
+    ))
+    assert(string.find(confirmationOutput, "extensionless /startup", 1, true))
+    assert(string.find(confirmationOutput, "startup directory", 1, true))
+    assert(string.find(confirmationOutput, "Manual CraftOS repair", 1, true))
+
+    inputs = { path .. "-wrong" }
+    inputIndex = 0
+    local wrong, wrongReason = guard.confirm({ inspection }, "edit", elevated)
+    assert(not wrong and wrongReason == "mismatch")
+
+    inputs = { "" }
+    inputIndex = 0
+    local blank, blankReason = guard.confirm({ inspection }, "edit", elevated)
+    assert(not blank and blankReason == "mismatch")
+
+    inputs = { { error = "Terminated" } }
+    inputIndex = 0
+    local terminated, terminatedReason = guard.confirm(
+        { inspection },
+        "edit",
+        elevated
+    )
+    assert(not terminated and terminatedReason == "cancelled")
+end
+
+assertStartupNamespaceConfirmation("/startup")
+assertStartupNamespaceConfirmation("/startup/test.lua")
 
 local catastrophicInspection = assert(guard.inspect(
     "/dickos",
