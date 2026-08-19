@@ -530,6 +530,55 @@ local function encodeScalar(value)
     return nil, "writer supports only boolean, number, and string values"
 end
 
+-- Serialise an already validated flat scalar table without applying a fixed
+-- schema. This is the narrow extension needed by machine-generated databases
+-- whose dotted keys contain dynamic identifiers such as usernames. It still
+-- enforces config-v1 key grammar and scalar encoding; the owning subsystem is
+-- responsible for its stronger semantic validation before calling this API.
+-- `format_version` remains first so generated data is immediately recognisable
+-- to a human inspecting it from Recovery.
+function config.serializeValues(values)
+    if type(values) ~= "table" then
+        return nil, "Writer values must be a table."
+    end
+
+    local keys, keyError = sortedStringKeys(values)
+
+    if keys == nil then
+        return nil, keyError
+    end
+
+    if values.format_version == nil then
+        return nil, "Writer values must contain format_version."
+    end
+
+    local orderedKeys = { "format_version" }
+
+    for _, key in ipairs(keys) do
+        if key ~= "format_version" then
+            orderedKeys[#orderedKeys + 1] = key
+        end
+    end
+
+    local lines = {}
+
+    for _, key in ipairs(orderedKeys) do
+        if not isValidKey(key) then
+            return nil, "Writer received invalid key '" .. key .. "'"
+        end
+
+        local encoded, encodeError = encodeScalar(values[key])
+
+        if encoded == nil then
+            return nil, "Unable to encode '" .. key .. "': " .. encodeError
+        end
+
+        lines[#lines + 1] = key .. " = " .. encoded
+    end
+
+    return table.concat(lines, "\n") .. "\n", nil
+end
+
 -- Produce canonical config v1 text. `format_version` is written first, then
 -- all remaining keys alphabetically. Programmatic writes therefore preserve
 -- values, not comments or the user's original spacing/order.
@@ -742,6 +791,19 @@ local function readConfigText(path)
     return textOrError, nil
 end
 
+-- Expose strict bounded reading for security-sensitive config-v1 consumers.
+-- Unlike `config.load`, this function never substitutes defaults: a missing,
+-- unreadable, oversized, or non-text file returns nil and its exact diagnostic.
+-- The caller still parses and validates the returned text according to the
+-- database contract it owns.
+function config.readText(path)
+    if type(path) ~= "string" or path == "" then
+        return nil, "Configuration path must be a non-empty string."
+    end
+
+    return readConfigText(path)
+end
+
 local function defaultsForFailedLoad(path, schema, reason, warnings)
     local defaults, defaultsError = config.defaults(schema)
 
@@ -868,15 +930,9 @@ end
 --
 -- Returns `true, warnings, nil` on success, or `false, warnings, reason` on
 -- failure. Filesystem exceptions are converted into those return values.
-function config.write(path, values, schema)
+local function writeSerialized(path, contents, warnings)
     if type(path) ~= "string" or path == "" then
-        return false, {}, "Configuration path must be a non-empty string."
-    end
-
-    local contents, warnings, serializeError = config.serialize(values, schema)
-
-    if contents == nil then
-        return false, warnings, serializeError
+        return false, warnings, "Configuration path must be a non-empty string."
     end
 
     if #contents > MAXIMUM_CONFIG_BYTES then
@@ -1014,6 +1070,32 @@ function config.write(path, values, schema)
     end
 
     return true, warnings, nil
+end
+
+
+function config.write(path, values, schema)
+    local contents, warnings, serializeError = config.serialize(values, schema)
+
+    if contents == nil then
+        return false, warnings, serializeError
+    end
+
+    return writeSerialized(path, contents, warnings)
+end
+
+-- Write a semantically pre-validated dynamic config-v1 table through the same
+-- `.tmp`/`.bak` replacement transaction used by ordinary configuration. This
+-- avoids duplicating recovery-sensitive filesystem logic in users.lua.
+function config.writeValues(path, values)
+    local contents, serializeError = config.serializeValues(values)
+
+    if contents == nil then
+        return false, serializeError
+    end
+
+    local succeeded, _, writeError = writeSerialized(path, contents, {})
+
+    return succeeded, writeError
 end
 
 return config

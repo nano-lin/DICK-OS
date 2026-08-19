@@ -351,6 +351,9 @@ filesystem layout and initial metadata
 init, Recovery, shell, shared libraries, configuration templates, and commands
     |
     v
+shared password/user modules create and re-load validated users.db
+    |
+    v
 Stage-0 payload file installed last
     |
     v
@@ -372,7 +375,13 @@ configuration itself.
 
 After explicit confirmation, deployment retains the existing rollback model.
 Stage-0 remains the final payload item written to `/startup.lua`, after its
-init, Recovery, shell, logger, configuration, and command dependencies.
+init, Recovery, login, shell, logger, configuration, authentication, and command
+dependencies. The installer does not execute fetched auth/password code before
+confirmation. Afterwards it loads the installed shared backend, validates the
+confirmed password, derives the owner verifier, creates machine-specific
+users.db transactionally, and strictly reloads it before writing Stage-0. Any
+verifier/database/load failure rolls back the installer-owned tree and startup
+settings. `users.db` is intentionally absent from the manifest.
 `install.lua` does not download, overwrite, or restart itself. Configuration
 templates are ordinary versioned payload files; the installer does not keep a
 second embedded copy of their defaults.
@@ -433,17 +442,20 @@ Hostname requirements:
 Username requirements:
 
 - 1-16 characters
-- lowercase
+- lowercase ASCII
 - starts with a letter
 - may contain:
   - lowercase letters
   - digits
   - underscore
-  - hyphen
+- `root` and `bootstrap` are reserved
 
-Password input must be masked.
+Password input is masked and confirmed. Passwords contain 8 through 128 bytes;
+no uppercase/digit/symbol composition rule is imposed.
 
-Passwords must never be stored in plaintext.
+Passwords must never be stored in plaintext. The confirmed installer value is
+retained only until post-confirmation verifier creation and then dereferenced;
+Lua garbage collection is not claimed to provide secure memory wiping.
 
 ---
 
@@ -607,6 +619,8 @@ Target installed layout:
     │   ├── log.lua
     │   ├── editor_buffer.lua
     │   ├── config.lua
+    │   ├── password.lua
+    │   ├── users.lua
     │   ├── auth.lua
     │   ├── integrity.lua
     │   ├── dicknet.lua
@@ -625,6 +639,9 @@ Target installed layout:
     │   ├── reboot.lua
     │   ├── shutdown.lua
     │   ├── status.lua
+    │   ├── whoami.lua
+    │   ├── id.lua
+    │   ├── passwd.lua
     │   ├── uname.lua
     │   └── uptime.lua
     ├── services/
@@ -655,9 +672,10 @@ src/
 The repository tree does not need to perfectly mirror the installed tree,
 but mapping between source paths and installed paths must remain obvious.
 
-The configuration-foundation milestone installs `config.lua`, `system.cfg`,
-`network.cfg`, and `services.cfg`. `users.db` remains a future authentication
-file shown in the target layout; it is not created by this milestone.
+The manifest installs versioned code and configuration templates, but never a
+static `users.db`. The installer creates that machine-specific database only
+after explicit confirmation, using the installed password/users modules, and
+validates it before making Stage-0 visible.
 
 ---
 
@@ -807,20 +825,25 @@ init.lua a giant file.
 The current implemented handoff is:
 
 ```text
-init -> persistent system configuration -> boot presentation
-     -> dickfetch -> /dickos/system/shell.lua
+init -> persistent system configuration -> authentication core/users.db
+     -> boot presentation -> dickfetch -> login
+     -> authenticated /dickos/system/shell.lua
 ```
 
 Init combines Stage-0's runtime API version and Boot ID with the installed
-version, hostname, and Machine ID. It adds the temporary bootstrap-session user
-and home, loads `/dickos/etc/system.cfg` through the required configuration
-library, then passes one in-memory table to the shell. Only the validated
-`shell.history_limit` value joins that shell session table; arbitrary parsed
-configuration is not forwarded to commands. Boot ID is never written to disk.
-A missing or broken configuration library, or a missing, invalid, crashing, or
-unexpectedly returning core shell, is an init failure and therefore reaches
-existing Stage-0 Recovery. This core contract is separate from user config
-data failures and the shell's protected child-command boundary.
+version, hostname, and Machine ID. It loads `/dickos/etc/system.cfg` through the
+required configuration library, requires auth core plus a strictly valid
+`/dickos/etc/users.db`, and then runs the native login program. Only a public
+authenticated identity and validated `shell.history_limit` join the shell
+session table; parsed configuration, users.db, verifiers, passwords, and auth
+modules are not forwarded. Boot ID is never written to disk.
+
+Init owns the session loop. The shell may return only `logout`; init records
+that transition best-effort and starts login again with the same Boot ID. A
+missing/broken auth dependency, invalid users.db, missing/crashing login, or
+missing/crashing/unexpectedly returning shell is an init failure and reaches
+Stage-0 Recovery. This core contract remains separate from optional config-data
+fallback and the shell's protected child-command boundary.
 
 ---
 
@@ -851,7 +874,7 @@ The current minimal init then animates only real bootstrap stages:
 [ .. ] Machine identity
 [    ] Hostname metadata
 [    ] Configuration
-[    ] Bootstrap session
+[    ] User database / auth core
 
 Activity: Machine identity
 [#####################--------------------]  50%
@@ -859,9 +882,9 @@ Activity: Machine identity
 
 A stage is represented by a small record containing a label and visual state.
 This leaves an obvious place to add future real init work without introducing a
-generic boot framework. Authentication, integrity, services, drivers, dickd,
-DickNet, and package management must not appear as successful stages until
-those subsystems exist.
+generic boot framework. User database/auth core now describes real validation;
+integrity, services, drivers, dickd, DickNet, and package management must not
+appear as successful stages until those subsystems exist.
 
 After progress completes, init clears the framed boot screen and invokes
 `/dickos/bin/dickfetch.lua`. Dickfetch is the canonical compact post-boot
@@ -877,10 +900,10 @@ while a missing, invalid, or crashing dickfetch is a noncritical presentation
 failure: init displays a minimal identity/status fallback rather than entering
 Recovery.
 
-After either successful dickfetch or that fallback, init starts the DICK shell.
-The successful presentation remains on screen, one blank line separates it
-from the first prompt, and dickfetch is not redrawn for later commands. The
-user may run `dickfetch` again explicitly like any other `/dickos/bin` utility.
+After either successful dickfetch or that fallback, init starts the native
+login screen. Successful authentication starts the DICK shell in the account's
+home. The user may run `dickfetch` again explicitly like any other
+`/dickos/bin` utility.
 
 ---
 
@@ -959,7 +982,10 @@ values. Validation is a separate step:
 
 The public module operations are `parse`, `validate`, `load`, `get`,
 `serialize`, and `write`; `defaults` exposes a fresh schema-default table for
-callers which need it. `load` applies a defensive 64 KiB limit. A missing,
+callers which need it. `readText`, `serializeValues`, and `writeValues` are the
+narrow strict/dynamic extension used by users.lua: they reuse config-v1 parsing
+and the same transaction without applying optional-setting defaults. `load`
+applies a defensive 64 KiB limit. A missing,
 unreadable, oversized, malformed, or unsupported-format user file returns safe
 defaults plus warnings and is not automatically overwritten during boot.
 
@@ -987,8 +1013,8 @@ neither persisted nor logged.
 `network.cfg` and `services.cfg` currently contain only `format_version = 1`
 plus explanatory comments. They reserve real versioned files for future
 DickNet and dickd schemas without enabling a network subsystem, fake services,
-or autostart. `users.db` is not created; authentication remains a later
-milestone and the installer password remains non-persistent.
+or autostart. `users.db` also uses config-v1 syntax, but users.lua owns its
+strict security semantics and never falls back to defaults or auto-recreation.
 
 `serialize` emits deterministic canonical syntax with `format_version` first
 and remaining keys sorted. Programmatic writing preserves scalar values but may
@@ -1008,56 +1034,114 @@ commands such as `cat /dickos/etc/system.cfg` and
 
 # 20. Users
 
-Future conceptual users:
+The installer creates `/dickos/etc/users.db` format 1 with two records:
 
-root
-    UID = 0
-    direct login = disabled
+```text
+root:  UID 0, admin=true, direct login disabled, no password
+owner: UID 1000, admin=true, direct login enabled, salted verifier
+```
 
-first human user
-    UID = 1000
-    admin = true
+`next_uid` begins at 1001. Root's home is `/dickos/home/root`; the owner home is
+`/dickos/home/<username>`. The `admin` flag is role metadata reserved for later
+authorization work and does not currently grant sudo or filesystem powers.
 
-The current installer asks for an owner name and creates its home directory,
-but does not yet persist reusable account metadata. The shell foundation
-therefore uses `bootstrap` and `/dickos/home/bootstrap`; the installer creates
-that directory as part of its owned tree. This is an unauthenticated
-development-session label, not a login or proof of identity. The installer
-password is not persisted or recovered.
+The flat config-v1 representation is canonical and conceptually contains:
 
-A later authentication milestone may create the initial owner account.
+```text
+format_version = 1
+next_uid = 1001
+user.root.uid = 0
+user.root.home = "/dickos/home/root"
+user.root.admin = true
+user.root.login_disabled = true
+user.root.password.algorithm = "disabled"
+user.nano.uid = 1000
+user.nano.home = "/dickos/home/nano"
+user.nano.admin = true
+user.nano.login_disabled = false
+user.nano.password.algorithm = "pbkdf2-hmac-sha256"
+user.nano.password.iterations = 4096
+user.nano.password.salt = "<32 lowercase hex characters>"
+user.nano.password.digest = "<64 lowercase hex characters>"
+```
 
-Future versions may support additional users.
+Usernames are 1 through 16 bytes and match `^[a-z][a-z0-9_]*$`, making each
+name exactly one valid config-v1 key segment. `root` and `bootstrap` are
+reserved, and input is rejected rather than silently lowercased.
+
+`/dickos/lib/users.lua` owns database semantics. Its public operations validate
+usernames/databases, load strictly, look up by name or UID, create the initial
+root/owner database, replace one verifier in a copied database, and write via
+the config transaction. Validation rejects unsupported format, malformed or
+unknown fields, duplicate UIDs, invalid flags/homes/verifiers, an incorrect
+root contract, a missing/incorrect UID-1000 owner, or invalid `next_uid`.
+
+Missing, unreadable, oversized, malformed, unsupported, or semantically invalid
+users.db is fatal authentication state. Init enters Recovery; it never creates
+bootstrap/anonymous access and never rewrites the database automatically.
+Additional user-management commands remain future work.
 
 ---
 
 # 21. Authentication
 
-Required functionality:
+The implemented password backend is `/dickos/lib/password.lua`. It implements
+the standard SHA-256, HMAC-SHA256, and PBKDF2-HMAC-SHA256 constructions with
+Lua 5.2 `bit32`, tested against published vectors. Stored verifier fields are:
 
-- login
-- logout
-- whoami
-- id
-- passwd
+```text
+algorithm  = "pbkdf2-hmac-sha256"
+iterations = 4096
+salt       = 16 bytes encoded as lowercase hex
+digest     = 32 derived bytes encoded as lowercase hex
+```
 
-Passwords must not be stored as plaintext.
+The production iteration count is central, with stored counts accepted only
+from 1000 through 100000 to prevent damaged data from requesting absurd work.
+Every new verifier receives a best-effort unique salt derived from changing
+CC:T runtime/machine inputs. Salt is not secret, and CC:T is not claimed to
+provide a cryptographically secure RNG. Digest comparison examines every byte
+best-effort, but Lua/CC:T cannot promise hard constant-time execution.
 
-DICK/OS must not invent a deliberately weak custom password hashing algorithm
-just to make authentication appear complete.
+Passwords must be 8 through 128 bytes. There are no arbitrary composition
+rules. Login, installer, and `passwd` use masked interactive reads and
+confirmation where a new password is chosen; passwords are never accepted as
+command arguments. Plaintext is never persisted or logged. Setting references
+to nil shortens their useful lifetime, but immutable garbage-collected Lua
+strings cannot be claimed to be securely wiped.
 
-The password backend should be isolated so the implementation can improve
-without rewriting the user subsystem.
+`password.lua` exposes verifier creation/verification/validation, shared
+password-policy validation, and vector-test primitives. `/dickos/lib/auth.lua`
+owns policy: state validation, authentication, and current-user password
+change. It distinguishes ordinary denial from broken state and transactional
+write failure. Only public name/UID/home/admin identity crosses into a session.
 
-DICK/OS authentication is an OS-level policy implemented in Lua.
+`/dickos/system/login.lua` is a black native UI showing DICK/OS, hostname, and
+masked credentials. Unknown user, wrong password, and disabled root login all
+display only `Login incorrect.` and loop. Ctrl+T is contained and redraws login
+without becoming a failed attempt. A broken auth state or login module is a
+core init failure and therefore Recovery.
 
-It is not equivalent to kernel-enforced Unix security.
+`logout` returns from the shell to init and starts login again without reboot,
+preserving Boot ID. `whoami`, `id`, and current-user-only `passwd` are native
+commands. `passwd` uses masked current/new/confirmation prompts; Ctrl+T remains
+an ordinary protected child termination and no database write begins before
+all prompt/policy checks and current-password verification succeed.
 
-Documentation and code must not pretend otherwise.
+DICK/OS authentication is an OS-level policy implemented in Lua, not a
+kernel-enforced Unix boundary. Recovery/CraftOS access or direct filesystem
+modification can bypass it. PBKDF2 here is materially better than plaintext or
+direct unsalted hashing, but pure-Lua PBKDF2 is not equivalent to a modern
+native memory-hard Argon2 implementation. Runtime cost must be measured on a
+real Advanced Computer before tuning.
 
 ---
 
 # 22. sudo-like privileges
+
+This section remains future design. The users/authentication foundation records
+an admin role but implements no sudo command, elevation, authorization cache,
+filesystem permissions, or root command execution.
 
 Administrative actions may require elevated privileges.
 
@@ -1081,20 +1165,19 @@ DICK/OS and obtains unrestricted lower-level execution.
 
 # 23. DICK shell
 
-The current bootstrap shell begins immediately after dickfetch, without a
-login screen:
+The current shell begins only after successful native login:
 
 ```text
-bootstrap@core-01:~$
+nano@core-01:~$
 ```
 
 It owns its prompt, cwd, home expansion, command parsing, command discovery,
-and execution protection. This session is not authenticated. The background is
+and execution protection. The background is
 black; prompt fragments use restrained semantic colours, and the shell restores
 background, foreground, and cursor blink before every new prompt so child
 presentation state cannot permanently damage it.
 
-The initial cwd and home are `/dickos/home/bootstrap`. An exact home path is
+The initial cwd and home come from the authenticated user record. An exact home path is
 displayed as `~`, descendants as `~/...`, and `~`/`~/...` are expanded for
 built-ins and native commands. Relative paths use the shell-owned cwd. Path
 normalisation removes empty and `.` segments, applies `..`, and clamps at `/`;
@@ -1132,16 +1215,17 @@ fatal runtime failure, or unexpected return is propagated through init to
 Stage-0 Recovery.
 
 Native programs under `/dickos/bin` receive a fresh first-argument context with
-runtime API version, Boot ID, version, hostname, Machine ID, bootstrap user,
-home, and a cwd snapshot. Explicit user programs outside that directory receive
+runtime API version, Boot ID, version, hostname, Machine ID, username, UID,
+admin flag, home, and a cwd snapshot. It contains no verifier, users database,
+password, or auth module. Explicit user programs outside that directory receive
 only their typed arguments. Boot ID therefore remains runtime-only. `dicklog`
 also retains direct CraftOS-rescue invocation with ordinary arguments.
 
-`exit` never falls through to CraftOS. It explains that exit is unavailable in
-bootstrap mode and directs the user to `reboot` or `shutdown`; explicit CraftOS
-access remains a Recovery selection only.
+`logout` returns the explicit session result consumed by init. `exit` never
+falls through to CraftOS; it directs the user to `logout`, `reboot`, or
+`shutdown`. Explicit CraftOS access remains a Recovery selection only.
 
-The bootstrap DICK shell does not implement mouse-wheel output scrollback. It
+The current DICK shell does not implement mouse-wheel output scrollback. It
 does not yet retain a historical output model, and calling `term.scroll()`
 would only move and discard visible terminal cells rather than navigate real
 history. Mouse-wheel shell scrollback remains a future shell feature and is
@@ -1153,12 +1237,13 @@ separate from native editor viewport scrolling.
 
 The current shell-foundation built-ins are:
 
-- `help`, `clear`, `cd`, `pwd`, `which`, `exit`.
+- `help`, `clear`, `cd`, `pwd`, `which`, `exit`, `logout`.
 
 The current external `/dickos/bin` commands are:
 
 - `ls`, `cat`, `echo`, `edit`;
 - `hostname`, `uname`, `uptime`, `df`, `status`;
+- `whoami`, `id`, `passwd`;
 - `reboot`, `shutdown`;
 - `dickfetch`, `dicklog`.
 
@@ -1176,13 +1261,8 @@ System:
 
 - peripherals
 
-Users:
+Users/authorization:
 
-- login
-- logout
-- whoami
-- id
-- passwd
 - sudo
 
 Services:
@@ -1247,7 +1327,7 @@ help sudo
 help service
 help dickctl
 
-The current bootstrap implementation registers short help for shell built-ins,
+The current shell implementation registers short help for shell built-ins,
 discovers runnable names from `/dickos/bin`, and asks an external command for
 its own `--help` output when `help <command>` is used. New binaries therefore
 become discoverable without editing a central command list. Full manual pages
@@ -1825,6 +1905,7 @@ The currently implemented logs are:
 
 /dickos/var/log/boot.log
 /dickos/var/log/system.log
+/dickos/var/log/auth.log
 
 Normal init and Recovery components use `/dickos/lib/log.lua`. The module
 creates an explicit logger bound to one log target and one runtime context; it
@@ -1855,18 +1936,23 @@ Ctrl+T init restarts and Recovery retries under the same Stage-0 execution. A
 new Stage-0 execution appends a new marker and normally has a new Boot ID.
 `system.log` begins the longer-lived system/session diagnostic stream. Init
 records configuration-library loading, system-config loading/default fallback,
-and bootstrap-session readiness. Configuration WARN records describe paths,
+authentication-state readiness, and authenticated session transitions.
+Configuration WARN records describe paths,
 keys, and diagnostics but never contain the complete file contents. The shell
 records startup, missing commands, ordinary command termination, and child
 load/runtime failures. Shell records include the resolved command name but
 deliberately omit the complete raw argument line so future secrets are not
 blindly copied into logs. Reboot and shutdown requests are also logged
-best-effort before invoking the real power API.
+best-effort before invoking the real power API. `auth.log` records successful
+login/logout/password changes, rejected login/password-change attempts at
+WARN, and authentication state/write failures. It never records passwords,
+password lengths, salts, digests, complete users.db contents, or raw commands.
 
-Both files are bounded before appending a record which would cross their limit:
+All files are bounded before appending a record which would cross their limit:
 
 - `boot.log`: 64 KiB;
 - `system.log`: 128 KiB.
+- `auth.log`: 64 KiB.
 
 The current file is moved to `<name>.1`, an older `.1` is removed, and only one
 rotated file is retained. There is no archive manager. Open, timestamp,
@@ -1874,14 +1960,15 @@ rotation, write, and close errors are all best-effort failures: logger failure
 must never cause init to enter Recovery or prevent Recovery/Fallback actions.
 
 `/dickos/bin/dicklog.lua` is the small current viewer. With no arguments it
-shows the last 20 active `boot.log` lines. It also accepts `boot`, `system`, and
-a positive line count, for example `dicklog boot 50`. It intentionally has no
+shows the last 20 active `boot.log` lines. It also accepts `boot`, `system`,
+`auth`, and a positive line count, for example `dicklog auth 50`. It
+intentionally has no
 search, filter, or archive framework yet and can be run directly by path from a
 CraftOS rescue shell. DICK shell invocation shifts its native context first;
 manual CraftOS forms and defaults remain unchanged.
 
-Future `/dickos/var/log/auth.log` and `/dickos/var/log/dicknet.log` remain
-planned. They are not created until their corresponding subsystems exist.
+Future `/dickos/var/log/dicknet.log` remains planned and is not created until
+that subsystem exists.
 
 Logging occurs on meaningful state transitions, not every timer tick.
 

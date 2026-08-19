@@ -1,4 +1,4 @@
--- DICK/OS bootstrap shell foundation
+-- DICK/OS authenticated shell foundation
 -- Version: 0.1.0-unstable
 
 local BIN_PATH = "/dickos/bin"
@@ -13,8 +13,9 @@ local HOSTNAME_COLOR = colors.lightBlue
 local STRUCTURE_COLOR = colors.lightGray
 
 -- Init calls this file as a compiled Lua chunk and supplies one explicit
--- session table through `...`. The table carries runtime-only identity into the
--- shell without writing Boot ID to disk. It is not an authentication record.
+-- session table through `...`. The table carries only the authenticated public
+-- identity and runtime metadata needed by the shell. Password verifiers and
+-- authentication modules are deliberately absent from this boundary.
 local sessionContext = ...
 
 -- Convert ordinary string errors and CC:T exception tables into text. Current
@@ -75,6 +76,15 @@ local function validateSessionContext(context)
 
     if string.sub(context.home, 1, 1) ~= "/" then
         error("DICK shell home directory must be an absolute path.", 0)
+    end
+
+    if type(context.uid) ~= "number" or
+        context.uid ~= math.floor(context.uid) or context.uid < 0 then
+        error("DICK shell context contains an invalid UID.", 0)
+    end
+
+    if type(context.isAdmin) ~= "boolean" then
+        error("DICK shell context contains an invalid admin flag.", 0)
     end
 
     if type(context.shellHistoryLimit) ~= "number" or
@@ -199,7 +209,7 @@ local function resolveUserPath(path, cwdSnapshot)
 end
 
 -- Display the exact home directory as `~` and descendants as `~/...`. A
--- neighbouring prefix such as `/dickos/home/bootstrap-old` is not shortened.
+-- neighbouring prefix such as `/dickos/home/nano-old` is not shortened.
 local function displayWorkingDirectory(path)
     if path == homeDirectory then
         return "~"
@@ -214,9 +224,9 @@ local function displayWorkingDirectory(path)
     return path
 end
 
--- The installer currently does not persist its owner username as reusable
--- account metadata. This milestone therefore uses the explicit unauthenticated
--- `bootstrap` identity and creates its owned home directory when needed.
+-- The installer creates the authenticated owner's home. Keeping this defensive
+-- check preserves a clear core failure if that path was replaced by a file and
+-- allows a manually repaired missing directory to be recreated.
 local function ensureHomeDirectory()
     local preparationSucceeded, preparationError = pcall(function()
         if fs.exists(homeDirectory) then
@@ -235,7 +245,7 @@ local function ensureHomeDirectory()
     end)
 
     if not preparationSucceeded then
-        local failure = "Unable to prepare bootstrap home " ..
+        local failure = "Unable to prepare authenticated home " ..
             homeDirectory .. ": " .. describeError(preparationError)
 
         logBestEffort("error", "shell", failure)
@@ -465,6 +475,8 @@ local function buildCommandContext()
         hostname = sessionContext.hostname,
         machineID = sessionContext.machineID,
         user = sessionContext.user,
+        uid = sessionContext.uid,
+        isAdmin = sessionContext.isAdmin,
         home = homeDirectory,
         cwd = currentWorkingDirectory,
     }
@@ -490,7 +502,7 @@ local function runHelp(arguments)
     end
 
     if topic == nil then
-        print("DICK/OS bootstrap shell")
+        print("DICK/OS authenticated shell")
         print()
         print("Built-ins:")
 
@@ -623,8 +635,25 @@ local function runExit(arguments)
         return
     end
 
-    print("Shell exit is unavailable in bootstrap mode.")
-    print("Use 'reboot' or 'shutdown'.")
+    print("Use 'logout' to return to login.")
+    print("Use 'reboot' or 'shutdown' for power control.")
+end
+
+-- Logout returns one explicit control result instead of starting another login
+-- screen inside the shell. Init owns session lifecycle and consumes this value
+-- to begin a fresh authentication attempt under the same runtime Boot ID.
+local function runLogout(arguments)
+    if arguments[1] == "--help" then
+        printBuiltinHelp("logout", builtins.logout)
+        return
+    end
+
+    if #arguments > 0 then
+        printShellError("Usage: " .. builtins.logout.usage)
+        return
+    end
+
+    return "logout"
 end
 
 builtins.help = {
@@ -653,9 +682,14 @@ builtins.which = {
     run = runWhich,
 }
 builtins.exit = {
-    summary = "describe the bootstrap shell exit policy",
+    summary = "describe the authenticated shell exit policy",
     usage = "exit",
     run = runExit,
+}
+builtins.logout = {
+    summary = "end this authenticated session",
+    usage = "logout",
+    run = runLogout,
 }
 
 -- Compile and run one external program behind a protected boundary. Load and
@@ -746,9 +780,9 @@ local function executeTokens(tokens)
     end
 
     if resolution.kind == "builtin" then
-        resolution.builtin.run(arguments)
+        return resolution.builtin.run(arguments)
     else
-        executeResolvedCommand(resolution, arguments)
+        return executeResolvedCommand(resolution, arguments)
     end
 end
 
@@ -808,7 +842,14 @@ while true do
         if tokens == nil then
             printShellError("Parse error: " .. parseError)
         elseif #tokens > 0 then
-            executeTokens(tokens)
+            local action = executeTokens(tokens)
+
+            if action == "logout" then
+                logBestEffort("info", "shell", "Shell logout requested")
+                restoreShellTerminal()
+                term.setCursorBlink(false)
+                return "logout"
+            end
         end
     end
 end

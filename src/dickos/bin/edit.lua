@@ -109,7 +109,7 @@ end
 
 -- Shorten the exact home directory and its descendants for the title bar.
 -- Checking the slash-terminated prefix avoids treating a neighbour such as
--- `/home/bootstrap-old` as if it were inside `/home/bootstrap`.
+-- `/home/nano-old` as if it were inside `/home/nano`.
 local function displayPath(path)
     local home = normalizeAbsolutePath(context.home)
 

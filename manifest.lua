@@ -8,7 +8,7 @@
 return {
     manifestVersion = 1,
     version = "0.1.0-unstable",
-    payloadID = "dickos-0.1.0-unstable-configuration-foundation",
+    payloadID = "dickos-0.1.0-unstable-users-auth-foundation",
 
     files = {
         {
@@ -24,12 +24,28 @@ return {
             target = "/dickos/system/shell.lua",
         },
         {
+            source = "src/dickos/system/login.lua",
+            target = "/dickos/system/login.lua",
+        },
+        {
             source = "src/dickos/lib/log.lua",
             target = "/dickos/lib/log.lua",
         },
         {
             source = "src/dickos/lib/config.lua",
             target = "/dickos/lib/config.lua",
+        },
+        {
+            source = "src/dickos/lib/password.lua",
+            target = "/dickos/lib/password.lua",
+        },
+        {
+            source = "src/dickos/lib/users.lua",
+            target = "/dickos/lib/users.lua",
+        },
+        {
+            source = "src/dickos/lib/auth.lua",
+            target = "/dickos/lib/auth.lua",
         },
         {
             source = "src/dickos/lib/editor_buffer.lua",
@@ -90,6 +106,18 @@ return {
         {
             source = "src/dickos/bin/status.lua",
             target = "/dickos/bin/status.lua",
+        },
+        {
+            source = "src/dickos/bin/whoami.lua",
+            target = "/dickos/bin/whoami.lua",
+        },
+        {
+            source = "src/dickos/bin/id.lua",
+            target = "/dickos/bin/id.lua",
+        },
+        {
+            source = "src/dickos/bin/passwd.lua",
+            target = "/dickos/bin/passwd.lua",
         },
         {
             source = "src/dickos/bin/reboot.lua",

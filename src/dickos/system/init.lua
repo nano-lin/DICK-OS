@@ -6,6 +6,8 @@ local HOSTNAME_PATH = "/dickos/etc/hostname"
 local MACHINE_ID_PATH = "/dickos/etc/machine-id"
 local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
 local SHELL_PATH = "/dickos/system/shell.lua"
+local LOGIN_PATH = "/dickos/system/login.lua"
+local AUTH_LIBRARY_PATH = "/dickos/lib/auth.lua"
 local LOG_LIBRARY_PATH = "/dickos/lib/log.lua"
 local CONFIG_LIBRARY_PATH = "/dickos/lib/config.lua"
 local SYSTEM_CONFIG_PATH = "/dickos/etc/system.cfg"
@@ -127,6 +129,7 @@ end
 
 local bootLogger = createBestEffortLogger("boot", runtimeContext)
 local systemLogger = createBestEffortLogger("system", runtimeContext)
+local authLogger = createBestEffortLogger("auth", runtimeContext)
 
 -- Configuration parsing is normal core functionality, unlike best-effort
 -- diagnostics. A missing, syntactically broken, or malformed config library
@@ -252,6 +255,67 @@ local function loadSystemConfiguration(configModule)
     return valuesOrError
 end
 
+-- Authentication code and users.db are security-critical state. Unlike the
+-- optional system.cfg policy above, no defaults or automatic account creation
+-- are safe here. Missing/broken modules or an invalid database therefore raise
+-- an init error which Stage-0 converts into the established Recovery path.
+local function requireAuthenticationState()
+    local loadSucceeded, programOrError, compileError = pcall(
+        loadfile,
+        AUTH_LIBRARY_PATH
+    )
+
+    if not loadSucceeded or type(programOrError) ~= "function" then
+        local failure = loadSucceeded and compileError or programOrError
+        local message = "Unable to load authentication core: " ..
+            tostring(failure)
+
+        logBestEffort(bootLogger, "error", "auth", message)
+        logBestEffort(
+            authLogger,
+            "error",
+            "auth",
+            "Authentication core load failed"
+        )
+        error(message, 0)
+    end
+
+    local runSucceeded, moduleOrError = pcall(programOrError)
+
+    if not runSucceeded or type(moduleOrError) ~= "table" or
+        type(moduleOrError.validateState) ~= "function" then
+        local message = "Unable to start authentication core: " ..
+            tostring(moduleOrError)
+
+        logBestEffort(bootLogger, "error", "auth", message)
+        logBestEffort(
+            authLogger,
+            "error",
+            "auth",
+            "Authentication core start failed"
+        )
+        error(message, 0)
+    end
+
+    local validationSucceeded, validOrError, validationError = pcall(
+        moduleOrError.validateState
+    )
+
+    if not validationSucceeded or validOrError ~= true then
+        local failure = validationSucceeded and validationError or validOrError
+        local message = "Authentication state is invalid: " ..
+            tostring(failure)
+
+        logBestEffort(bootLogger, "error", "auth", message)
+        logBestEffort(authLogger, "error", "auth", "Authentication state invalid")
+        error(message, 0)
+    end
+
+    logBestEffort(bootLogger, "info", "auth", "Authentication core validated")
+    logBestEffort(systemLogger, "info", "auth", "User database validated")
+    return moduleOrError
+end
+
 -- Each stage is a small Lua table containing the text shown to the user and
 -- its current visual state. This is enough structure for later init work to
 -- add real bootstrap stages without creating a generic boot framework now.
@@ -262,7 +326,7 @@ local BOOT_STAGES = {
     { label = "Machine identity", state = "pending" },
     { label = "Hostname metadata", state = "pending" },
     { label = "Configuration", state = "pending" },
-    { label = "Bootstrap session", state = "pending" },
+    { label = "User database / auth core", state = "pending" },
 }
 
 local function prepareTerminal()
@@ -624,6 +688,38 @@ local function runDickfetch(context)
     return true, nil
 end
 
+-- Login is a core boundary: missing or crashing UI must not skip credentials or
+-- expose a shell. A successful program returns only the public user identity
+-- produced by auth.lua; verifier/database details never enter init's session
+-- context.
+local function runLogin(context)
+    local loadSucceeded, loginProgram, loadError = pcall(loadfile, LOGIN_PATH)
+
+    if not loadSucceeded or type(loginProgram) ~= "function" then
+        local failure = loadSucceeded and loadError or loginProgram
+
+        return nil, "Unable to load DICK login: " .. tostring(failure)
+    end
+
+    local loginSucceeded, userOrError = pcall(loginProgram, context)
+
+    if not loginSucceeded then
+        return nil, "DICK login failed: " .. tostring(userOrError)
+    end
+
+    if type(userOrError) ~= "table" or
+        type(userOrError.name) ~= "string" or userOrError.name == "" or
+        type(userOrError.uid) ~= "number" or
+        userOrError.uid ~= math.floor(userOrError.uid) or
+        type(userOrError.home) ~= "string" or
+        string.sub(userOrError.home, 1, 1) ~= "/" or
+        type(userOrError.admin) ~= "boolean" then
+        return nil, "DICK login returned an invalid user identity."
+    end
+
+    return userOrError, nil
+end
+
 -- Show required identity values even when the richer dickfetch presentation
 -- cannot run. This keeps a cosmetic utility failure visibly degraded but does
 -- not misreport healthy metadata as a catastrophic boot failure.
@@ -648,7 +744,7 @@ end
 -- Start the core shell behind init's own boundary. A missing or malformed
 -- shell is not a cosmetic failure: returning a reason lets the caller log it
 -- and raise an init error into the established Stage-0 Recovery path. A
--- healthy interactive shell is expected not to return from this call at all.
+-- healthy interactive shell may return only the explicit `logout` result.
 local function runShell(context)
     local loadSucceeded, shellProgram, loadError = pcall(
         loadfile,
@@ -658,16 +754,21 @@ local function runShell(context)
     if not loadSucceeded or type(shellProgram) ~= "function" then
         local failure = loadSucceeded and loadError or shellProgram
 
-        return "Unable to load DICK shell: " .. tostring(failure)
+        return nil, "Unable to load DICK shell: " .. tostring(failure)
     end
 
-    local shellSucceeded, shellError = pcall(shellProgram, context)
+    local shellSucceeded, shellResult = pcall(shellProgram, context)
 
     if not shellSucceeded then
-        return "DICK shell failed: " .. tostring(shellError)
+        return nil, "DICK shell failed: " .. tostring(shellResult)
     end
 
-    return "DICK shell returned unexpectedly."
+    if shellResult == "logout" then
+        return "logout", nil
+    end
+
+    return nil, "DICK shell returned an invalid result: " ..
+        tostring(shellResult)
 end
 
 prepareTerminal()
@@ -701,6 +802,13 @@ if type(bootCosmeticDelay) ~= "boolean" or
     logBestEffort(bootLogger, "error", "config", message)
     error(message, 0)
 end
+
+
+-- Keep the returned module alive only as proof that all authentication core
+-- dependencies compiled and users.db validated. Login loads the same stateless
+-- policy module for each attempt; no credential state is cached in init.
+local authModule = requireAuthenticationState()
+authModule = nil
 
 logBestEffort(bootLogger, "info", "init", "Normal boot UI starting")
 drawBootHeader(version)
@@ -737,27 +845,64 @@ if not presentationSucceeded then
     drawDickfetchFallback(dickfetchContext, presentationError)
 end
 
-logBestEffort(bootLogger, "info", "init", "Bootstrap session ready")
-logBestEffort(systemLogger, "info", "init", "Bootstrap session ready")
+logBestEffort(bootLogger, "info", "init", "Login service ready")
+logBestEffort(systemLogger, "info", "init", "Login service ready")
 
--- Authentication does not exist yet and the installer does not persist its
--- owner prompt as account metadata. This explicit `bootstrap` identity is a
--- development-session label, not proof of authentication. Boot ID remains in
--- memory and is handed directly to shell commands instead of being persisted.
-local shellContext = {
+local loginContext = {
     runtimeApiVersion = runtimeContext.apiVersion,
     bootID = bootID,
     version = version,
     hostname = hostname,
     machineID = machineID,
-    user = "bootstrap",
-    home = "/dickos/home/bootstrap",
-    shellHistoryLimit = shellHistoryLimit,
 }
 
-logBestEffort(bootLogger, "info", "init", "DICK shell starting")
-local shellFailure = runShell(shellContext)
+-- Init owns the session loop. Logout returns here without rebooting, then the
+-- same login context begins another authentication attempt under the same
+-- Stage-0 Boot ID. Any other shell/login return remains a core failure.
+while true do
+    logBestEffort(bootLogger, "info", "login", "DICK login starting")
+    local authenticatedUser, loginError = runLogin(loginContext)
 
-logBestEffort(bootLogger, "error", "shell", shellFailure)
-logBestEffort(systemLogger, "error", "shell", shellFailure)
-error(shellFailure, 0)
+    if authenticatedUser == nil then
+        logBestEffort(bootLogger, "error", "login", loginError)
+        logBestEffort(systemLogger, "error", "login", loginError)
+        error(loginError, 0)
+    end
+
+    local shellContext = {
+        runtimeApiVersion = runtimeContext.apiVersion,
+        bootID = bootID,
+        version = version,
+        hostname = hostname,
+        machineID = machineID,
+        user = authenticatedUser.name,
+        uid = authenticatedUser.uid,
+        home = authenticatedUser.home,
+        isAdmin = authenticatedUser.admin,
+        shellHistoryLimit = shellHistoryLimit,
+    }
+
+    authenticatedUser = nil
+    logBestEffort(bootLogger, "info", "init", "Authenticated shell starting")
+    local shellResult, shellFailure = runShell(shellContext)
+
+    if shellResult ~= "logout" then
+        logBestEffort(bootLogger, "error", "shell", shellFailure)
+        logBestEffort(systemLogger, "error", "shell", shellFailure)
+        error(shellFailure, 0)
+    end
+
+    logBestEffort(
+        systemLogger,
+        "info",
+        "shell",
+        "Authenticated session logged out"
+    )
+    logBestEffort(
+        authLogger,
+        "info",
+        "logout",
+        "Logout for " .. shellContext.user ..
+            " uid=" .. tostring(shellContext.uid)
+    )
+end

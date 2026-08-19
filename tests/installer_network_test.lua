@@ -4,6 +4,7 @@
 local RAW_PREFIX =
     "https://raw.githubusercontent.com/nano-lin/DICK-OS/main/"
 local MIB = 1024 * 1024
+local hostLoadfile = loadfile
 
 local function readHostFile(path)
     local file = assert(io.open(path, "rb"))
@@ -62,6 +63,7 @@ local function runScenario(options)
         output = {},
         requests = {},
         settingsSaveCalls = 0,
+        installedModuleLoads = 0,
         settingValues = {
             ["shell.allow_disk_startup"] = true,
         },
@@ -81,6 +83,10 @@ local function runScenario(options)
     fsMock.getFreeSpace = function(path)
         assert(path == "/")
         return options.freeSpace or 8 * MIB
+    end
+
+    fsMock.getSize = function(path)
+        return #assert(state.files[path])
     end
 
     fsMock.exists = function(path)
@@ -104,6 +110,19 @@ local function runScenario(options)
     end
 
     fsMock.open = function(path, mode)
+        if mode == "r" then
+            local contents = state.files[path]
+
+            if contents == nil then
+                return nil, "not found"
+            end
+
+            return {
+                readAll = function() return contents end,
+                close = function() end,
+            }
+        end
+
         assert(mode == "w", "unexpected filesystem mode: " .. tostring(mode))
         recordMutation("write-open:" .. path)
         state.openedWritePaths[#state.openedWritePaths + 1] = path
@@ -153,6 +172,20 @@ local function runScenario(options)
             state.files[path] = nil
             state.directories[path] = nil
         end
+    end
+
+    fsMock.move = function(sourcePath, targetPath)
+        recordMutation("move:" .. sourcePath .. ":" .. targetPath)
+
+        if options.usersDatabaseMoveFailure and
+            sourcePath == "/dickos/etc/users.db.tmp" then
+            error("simulated users.db replacement failure", 0)
+        end
+
+        assert(state.files[sourcePath] ~= nil)
+        assert(state.files[targetPath] == nil)
+        state.files[targetPath] = state.files[sourcePath]
+        state.files[sourcePath] = nil
     end
 
     local settingsMock = {}
@@ -231,7 +264,8 @@ local function runScenario(options)
                 )
             end
 
-            local body = payloadBodies[source]
+            local body = options.payloadOverrides and
+                options.payloadOverrides[source] or payloadBodies[source]
 
             if options.emptySource == source then
                 body = ""
@@ -248,12 +282,12 @@ local function runScenario(options)
         end
     end
 
-    local inputValues = {
+    local inputValues = options.inputValues or {
         "test-01",
         "nano",
-        "secret",
-        "secret",
-        "y",
+        "secretpass",
+        "secretpass",
+        options.confirmAnswer or "y",
     }
     local inputIndex = 0
 
@@ -301,6 +335,17 @@ local function runScenario(options)
 
     setmetatable(environment, { __index = _G })
     environment._G = environment
+    environment.loadfile = function(path)
+        local contents = state.files[path]
+
+        if contents ~= nil then
+            state.installedModuleLoads = state.installedModuleLoads + 1
+            recordMutation("module-load:" .. path)
+            return load(contents, "@" .. path, "t", environment)
+        end
+
+        return hostLoadfile(path, "t", environment)
+    end
 
     local installerProgram = assert(loadfile("install.lua", "t", environment))
     local installerSucceeded, installerError = pcall(installerProgram)
@@ -346,6 +391,10 @@ assert(next(discoveredSources) == nil, "manifest omits a current source file")
 assert(manifest.files[#manifest.files].source == "src/startup.lua")
 assert(manifest.files[#manifest.files].target == "/startup.lua")
 
+for _, manifestFile in ipairs(manifest.files) do
+    assert(manifestFile.target ~= "/dickos/etc/users.db")
+end
+
 local expectedConfigurationTargets = {
     ["src/dickos/lib/config.lua"] = "/dickos/lib/config.lua",
     ["src/dickos/etc/system.cfg"] = "/dickos/etc/system.cfg",
@@ -378,6 +427,16 @@ assert(success.files["/dickos/etc/network.cfg"] ==
     payloadBodies["src/dickos/etc/network.cfg"])
 assert(success.files["/dickos/etc/services.cfg"] ==
     payloadBodies["src/dickos/etc/services.cfg"])
+assert(type(success.files["/dickos/etc/users.db"]) == "string")
+assert(contains(success.files["/dickos/etc/users.db"],
+    "user.nano.uid = 1000"))
+assert(contains(success.files["/dickos/etc/users.db"],
+    "user.root.uid = 0"))
+assert(contains(success.files["/dickos/etc/users.db"],
+    "user.root.login_disabled = true"))
+assert(not contains(success.files["/dickos/etc/users.db"], "secretpass"))
+assert(not contains(success.outputText, "secretpass"))
+assert(success.installedModuleLoads > 0)
 
 local lastHTTPAction = 0
 local firstDeploymentAction = nil
@@ -392,6 +451,70 @@ end
 
 assert(firstDeploymentAction ~= nil)
 assert(lastHTTPAction < firstDeploymentAction)
+
+local usersDatabaseMoveAction = nil
+local startupWriteAction = nil
+
+for actionIndex, action in ipairs(success.actions) do
+    if string.find(action, "move:/dickos/etc/users.db.tmp", 1, true) == 1 then
+        usersDatabaseMoveAction = actionIndex
+    elseif action == "write-open:/startup.lua" then
+        startupWriteAction = actionIndex
+    end
+end
+
+assert(usersDatabaseMoveAction ~= nil)
+assert(startupWriteAction ~= nil)
+assert(usersDatabaseMoveAction < startupWriteAction)
+
+local cancelled = runScenario({ confirmAnswer = "n" })
+assertNoPersistentMutation(cancelled)
+assert(cancelled.installedModuleLoads == 0)
+assert(cancelled.files["/dickos/etc/users.db"] == nil)
+
+local correctedUsername = runScenario({
+    inputValues = {
+        "test-01",
+        "nano-user",
+        "nano",
+        "secretpass",
+        "secretpass",
+        "y",
+    },
+})
+assert(contains(correctedUsername.outputText, "a-z, 0-9, or underscore"))
+assert(contains(correctedUsername.files["/dickos/etc/users.db"],
+    "user.nano.uid = 1000"))
+
+local reservedUsernames = runScenario({
+    inputValues = {
+        "test-01",
+        "root",
+        "bootstrap",
+        "nano",
+        "secretpass",
+        "secretpass",
+        "y",
+    },
+})
+assert(contains(reservedUsernames.outputText, "Username is reserved: root"))
+assert(contains(
+    reservedUsernames.outputText,
+    "Username is reserved: bootstrap"
+))
+
+local shortPassword = runScenario({
+    inputValues = {
+        "test-01",
+        "nano",
+        "short",
+        "short",
+        "y",
+    },
+})
+assert(shortPassword.directories["/dickos"] == nil)
+assert(shortPassword.files["/startup.lua"] == nil)
+assert(contains(shortPassword.outputText, "at least 8 bytes"))
 
 local missingManifest = runScenario({ missingSource = "manifest.lua" })
 assertNoPersistentMutation(missingManifest)
@@ -477,5 +600,54 @@ assert(settingsFailure.directories["/dickos"] == nil)
 assert(settingsFailure.files["/startup.lua"] == nil)
 assert(settingsFailure.settingValues["shell.allow_startup"] == nil)
 assert(settingsFailure.settingValues["shell.allow_disk_startup"] == true)
+
+local usersDatabaseFailure = runScenario({ usersDatabaseMoveFailure = true })
+assert(usersDatabaseFailure.directories["/dickos"] == nil)
+assert(usersDatabaseFailure.files["/startup.lua"] == nil)
+assert(contains(
+    usersDatabaseFailure.outputText,
+    "Unable to create the initial authenticated owner"
+))
+
+local verifierFailure = runScenario({
+    payloadOverrides = {
+        ["src/dickos/lib/password.lua"] = [[
+return {
+    validatePassword = function() return true end,
+    createVerifier = function()
+        return nil, "simulated verifier failure"
+    end,
+}
+]],
+    },
+})
+assert(verifierFailure.directories["/dickos"] == nil)
+assert(verifierFailure.files["/startup.lua"] == nil)
+assert(contains(verifierFailure.outputText, "simulated verifier failure"))
+
+local validationFailure = runScenario({
+    payloadOverrides = {
+        ["src/dickos/lib/users.lua"] = [[
+return {
+    createInitial = function() return {} end,
+    write = function(_, path)
+        local file = assert(fs.open(path, "w"))
+        file.write("format_version = 1\n")
+        file.close()
+        return true
+    end,
+    load = function()
+        return nil, "simulated users.db validation failure"
+    end,
+}
+]],
+    },
+})
+assert(validationFailure.directories["/dickos"] == nil)
+assert(validationFailure.files["/startup.lua"] == nil)
+assert(contains(
+    validationFailure.outputText,
+    "simulated users.db validation failure"
+))
 
 io.stdout:write("installer network tests: PASS\n")

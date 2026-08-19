@@ -1,10 +1,10 @@
 -- DICK/OS minimal persistent logger
 -- Version: 0.1.0-unstable
 
--- This module owns only two current log destinations. Keeping their paths and
+-- This module owns the current log destinations. Keeping their paths and
 -- size limits together prevents each normal component from inventing a
--- slightly different rotation policy. Authentication and DickNet logs do not
--- belong here until those subsystems actually exist.
+-- slightly different rotation policy. Authentication now has its own smaller
+-- target; DickNet remains absent until that subsystem actually exists.
 local LOG_TARGETS = {
     boot = {
         path = "/dickos/var/log/boot.log",
@@ -13,6 +13,10 @@ local LOG_TARGETS = {
     system = {
         path = "/dickos/var/log/system.log",
         maximumBytes = 128 * 1024,
+    },
+    auth = {
+        path = "/dickos/var/log/auth.log",
+        maximumBytes = 64 * 1024,
     },
 }
 
@@ -127,7 +131,7 @@ local log = {}
 
 -- Create a small logger bound to one destination and one runtime Boot ID.
 --
--- `targetName` is currently either `boot` or `system`. `runtimeContext` is the
+-- `targetName` is currently `boot`, `system`, or `auth`. `runtimeContext` is the
 -- explicit table owned by Stage-0. A missing or malformed context uses the
 -- literal `UNKNOWN` field so init can best-effort log the compatibility error
 -- before rejecting that context. The returned table contains five functions;

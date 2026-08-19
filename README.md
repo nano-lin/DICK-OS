@@ -43,6 +43,13 @@ The installer currently follows the mutable `main` branch. This is an unstable
 development transport, not a cryptographic integrity guarantee or a pinned
 release. A failed or incomplete download aborts before deployment.
 
+A confirmed fresh install creates the chosen owner as UID 1000 and a
+direct-login-disabled root record. The password is entered interactively and
+persisted only as a salted PBKDF2-HMAC-SHA256 verifier in machine-specific
+`/dickos/etc/users.db`.
+
 ## Status
 
-Early development. Expect breaking changes.
+Early development. The current unstable foundation includes native owner login,
+`whoami`, `id`, `passwd`, and logout-to-login. Sudo, filesystem permissions,
+and user-management commands are not implemented yet. Expect breaking changes.

@@ -10,6 +10,8 @@ local SYSTEM_CONFIG_PATH = "/dickos/etc/system.cfg"
 local LOG_PATH = "/dickos/lib/log.lua"
 local DICKFETCH_PATH = "/dickos/bin/dickfetch.lua"
 local INSTALLED_SHELL_PATH = "/dickos/system/shell.lua"
+local AUTH_PATH = "/dickos/lib/auth.lua"
+local LOGIN_PATH = "/dickos/system/login.lua"
 
 local SHELL_TEST_STOP = "__DICK_CONFIG_INTEGRATION_SHELL_REACHED__"
 local INPUT_TEST_STOP = "__DICK_CONFIG_INTEGRATION_INPUT_STOP__"
@@ -88,6 +90,8 @@ local function runInitScenario(options)
     local state = {
         logs = {},
         shellContext = nil,
+        shellContexts = {},
+        loginCount = 0,
         timerCount = 0,
     }
     local metadata = {
@@ -188,9 +192,53 @@ local function runInitScenario(options)
             return function() end
         end
 
+        if path == AUTH_PATH then
+            if options.missingAuthCore then
+                return nil, "simulated missing auth.lua"
+            end
+
+            return function()
+                return {
+                    validateState = function()
+                        if options.invalidAuthenticationState then
+                            return false, "simulated invalid users.db"
+                        end
+
+                        return true
+                    end,
+                }
+            end
+        end
+
+        if path == LOGIN_PATH then
+            if options.missingLoginModule then
+                return nil, "simulated missing login.lua"
+            end
+
+            return function()
+                state.loginCount = state.loginCount + 1
+                return {
+                    name = "nano",
+                    uid = 1000,
+                    home = "/dickos/home/nano",
+                    admin = true,
+                }
+            end
+        end
+
         if path == INSTALLED_SHELL_PATH then
             return function(context)
                 state.shellContext = context
+                state.shellContexts[#state.shellContexts + 1] = context
+
+                if options.logoutOnce and #state.shellContexts == 1 then
+                    return "logout"
+                end
+
+                if options.invalidShellReturn then
+                    return "unexpected"
+                end
+
                 error(SHELL_TEST_STOP, 0)
             end
         end
@@ -212,6 +260,14 @@ assert(not delayedSucceeded)
 assert(contains(delayedFailure, SHELL_TEST_STOP))
 assert(delayedState.shellContext ~= nil)
 assert(delayedState.shellContext.shellHistoryLimit == 64)
+assert(delayedState.shellContext.user == "nano")
+assert(delayedState.shellContext.uid == 1000)
+assert(delayedState.shellContext.home == "/dickos/home/nano")
+assert(delayedState.shellContext.isAdmin == true)
+assert(delayedState.shellContext.password == nil)
+assert(delayedState.shellContext.verifier == nil)
+assert(delayedState.shellContext.users == nil)
+assert(delayedState.shellContext.auth == nil)
 assert(delayedState.timerCount == 24)
 assert(hasLog(delayedState, "info", "Configuration library loaded"))
 assert(hasLog(delayedState, "info", "System configuration loaded"))
@@ -277,6 +333,48 @@ assert(not brokenCoreSucceeded)
 assert(brokenCoreState.shellContext == nil)
 assert(contains(brokenCoreFailure, "Unable to start configuration core"))
 
+local missingAuthState, missingAuthSucceeded, missingAuthFailure =
+    runInitScenario({ missingAuthCore = true })
+assert(not missingAuthSucceeded)
+assert(missingAuthState.shellContext == nil)
+assert(contains(missingAuthFailure, "Unable to load authentication core"))
+
+local invalidAuthState, invalidAuthSucceeded, invalidAuthFailure =
+    runInitScenario({ invalidAuthenticationState = true })
+assert(not invalidAuthSucceeded)
+assert(invalidAuthState.shellContext == nil)
+assert(contains(invalidAuthFailure, "Authentication state is invalid"))
+
+local missingLoginState, missingLoginSucceeded, missingLoginFailure =
+    runInitScenario({ missingLoginModule = true })
+assert(not missingLoginSucceeded)
+assert(missingLoginState.shellContext == nil)
+assert(contains(missingLoginFailure, "Unable to load DICK login"))
+
+local logoutState, logoutSucceeded, logoutFailure = runInitScenario({
+    logoutOnce = true,
+    configText = table.concat({
+        "format_version = 1",
+        "boot.cosmetic_delay = false",
+        "shell.history_limit = 64",
+        "",
+    }, "\n"),
+})
+assert(not logoutSucceeded)
+assert(contains(logoutFailure, SHELL_TEST_STOP))
+assert(logoutState.loginCount == 2)
+assert(#logoutState.shellContexts == 2)
+assert(logoutState.shellContexts[1].bootID == "B-1234ABCD")
+assert(logoutState.shellContexts[2].bootID == "B-1234ABCD")
+assert(logoutState.shellContexts[1].uid == 1000)
+assert(logoutState.shellContexts[1].isAdmin == true)
+
+local invalidReturnState, invalidReturnSucceeded, invalidReturnFailure =
+    runInitScenario({ invalidShellReturn = true })
+assert(not invalidReturnSucceeded)
+assert(invalidReturnState.loginCount == 1)
+assert(contains(invalidReturnFailure, "invalid result"))
+
 -- SHELL HISTORY -----------------------------------------------------------
 
 local function copyList(list)
@@ -289,7 +387,7 @@ local function copyList(list)
     return copied
 end
 
-local function runShellHistoryScenario(historyLimit, inputLines)
+local function runShellHistoryScenario(historyLimit, inputLines, expectedReturn)
     local state = {
         cursorX = 1,
         cursorY = 1,
@@ -327,10 +425,10 @@ local function runShellHistoryScenario(historyLimit, inputLines)
 
     environment.fs = {
         exists = function(path)
-            return path == "/dickos/home/bootstrap"
+            return path == "/dickos/home/nano"
         end,
         isDir = function(path)
-            return path == "/dickos/home/bootstrap"
+            return path == "/dickos/home/nano"
         end,
         makeDir = function() end,
         list = function() return {} end,
@@ -368,13 +466,21 @@ local function runShellHistoryScenario(historyLimit, inputLines)
         version = "0.1.0-unstable",
         hostname = "test-01",
         machineID = "DCK-C-11-A91F",
-        user = "bootstrap",
-        home = "/dickos/home/bootstrap",
+        user = "nano",
+        uid = 1000,
+        home = "/dickos/home/nano",
+        isAdmin = true,
         shellHistoryLimit = historyLimit,
     })
 
-    assert(not succeeded)
-    assert(contains(failure, INPUT_TEST_STOP))
+    if expectedReturn ~= nil then
+        assert(succeeded)
+        assert(failure == expectedReturn)
+    else
+        assert(not succeeded)
+        assert(contains(failure, INPUT_TEST_STOP))
+    end
+
     return state
 end
 
@@ -398,5 +504,14 @@ local disabledHistoryState = runShellHistoryScenario(0, {
 for _, history in ipairs(disabledHistoryState.histories) do
     assert(#history == 0)
 end
+
+local logoutShellState = runShellHistoryScenario(64, { "logout" }, "logout")
+assert(#logoutShellState.histories == 1)
+local logoutHelpState = runShellHistoryScenario(
+    64,
+    { "logout --help", "logout" },
+    "logout"
+)
+assert(#logoutHelpState.histories == 2)
 
 io.stdout:write("configuration integration tests: PASS\n")

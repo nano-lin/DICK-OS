@@ -4,6 +4,7 @@
 local LOG_PATHS = {
     boot = "/dickos/var/log/boot.log",
     system = "/dickos/var/log/system.log",
+    auth = "/dickos/var/log/auth.log",
 }
 
 local DEFAULT_LOG_NAME = "boot"
@@ -30,11 +31,12 @@ local function prepareTerminal()
 end
 
 local function printUsage()
-    print("Usage: dicklog [boot|system] [line-count]")
+    print("Usage: dicklog [boot|system|auth] [line-count]")
     print("Examples:")
     print("  dicklog")
     print("  dicklog boot 50")
     print("  dicklog system")
+    print("  dicklog auth 50")
 end
 
 if requestedLogName == "--help" then

@@ -9,6 +9,9 @@ local ROOT_PATH = "/"
 local INSTALL_PATH = "/dickos"
 local STARTUP_PATH = "/startup.lua"
 local ALTERNATE_STARTUP_PATH = "/startup"
+local PASSWORD_LIBRARY_PATH = "/dickos/lib/password.lua"
+local USERS_LIBRARY_PATH = "/dickos/lib/users.lua"
+local USERS_DATABASE_PATH = "/dickos/etc/users.db"
 
 -- The development channel is intentionally expressed as separate repository
 -- coordinates. Replacing `main` with a tag or immutable commit later changes
@@ -278,18 +281,24 @@ local function validateHostname(hostname)
     return true, nil
 end
 
--- Usernames start with a lowercase letter. The `*` in the second character
--- class permits zero or more additional lowercase letters, digits,
--- underscores, or hyphens.
+-- Usernames are also used as one dynamic config-v1 key segment in users.db.
+-- The grammar therefore permits exactly lowercase letters, digits, and
+-- underscore after a leading lowercase letter. `root` and the retired
+-- development identity `bootstrap` are reserved by the shared users module;
+-- this pre-deployment mirror rejects them without executing downloaded code.
 local function validateUsername(username)
     if #username < 1 or #username > 16 then
         return false, "Username must contain 1 to 16 characters."
     end
 
-    if not string.match(username, "^[a-z][a-z0-9_-]*$") then
+    if not string.match(username, "^[a-z][a-z0-9_]*$") then
         return false,
             "Username must start with a lowercase letter and use only " ..
-            "a-z, 0-9, underscore, or hyphen."
+            "a-z, 0-9, or underscore."
+    end
+
+    if username == "root" or username == "bootstrap" then
+        return false, "Username is reserved: " .. username
     end
 
     return true, nil
@@ -319,10 +328,11 @@ local function promptForValidatedValue(promptText, validator)
     end
 end
 
--- Exercise the intended password-entry UX without creating authentication.
+-- Collect the initial password with confirmation and masked terminal input.
 -- Passing "*" to CC:T's `read` function replaces displayed characters with
--- asterisks. The returned strings still contain the real input, so they remain
--- local to this function and are never returned, logged, or written to disk.
+-- asterisks. The returned strings still contain plaintext. The confirmed value
+-- is returned only to runInstaller, retained until the post-confirmation shared
+-- password backend creates a verifier, and never logged or written directly.
 local function confirmPasswordEntry()
     while true do
         write("Password: ")
@@ -332,9 +342,12 @@ local function confirmPasswordEntry()
         local confirmation = read("*")
 
         if password == confirmation then
-            return
+            confirmation = nil
+            return password
         end
 
+        password = nil
+        confirmation = nil
         fail("Passwords do not match.")
         print("Please enter both passwords again.")
         print()
@@ -883,11 +896,9 @@ end
 -- directories too. Each call is protected and then verified because failure
 -- of any directory is fatal to this installation.
 local function createDirectoryLayout(ownerUsername)
-    -- The requested owner directory preserves the tested installer layout.
-    -- Because no account metadata exists yet, the interactive milestone also
-    -- needs a separate documented bootstrap home. If the requested name is
-    -- itself `bootstrap`, calling `fs.makeDir` twice is harmless and verified
-    -- as a directory both times.
+    -- Owner and root home paths match the records written to users.db. Root's
+    -- directory exists for structural consistency even though direct root login
+    -- is disabled and no privilege-elevation milestone exists yet.
     local directories = {
         "/dickos/system",
         "/dickos/lib",
@@ -895,7 +906,7 @@ local function createDirectoryLayout(ownerUsername)
         "/dickos/services",
         "/dickos/etc",
         "/dickos/home/" .. ownerUsername,
-        "/dickos/home/bootstrap",
+        "/dickos/home/root",
         "/dickos/var/log",
         "/dickos/var/lib",
         "/dickos/var/integrity",
@@ -986,21 +997,12 @@ end
 -- call occurs here: this critical phase consumes only the validated in-memory
 -- list returned after the complete fetch phase.
 --
--- The startup ownership flag is set before attempting its write. Preflight and
--- the immediate pre-deployment recheck proved that `/startup.lua` was absent,
--- so any partial file created by this attempt belongs to this installer and may
--- be removed safely during rollback.
-local function writeSystemPayload(payload)
-    for _, payloadFile in ipairs(payload) do
-        if payloadFile.target == STARTUP_PATH then
-            if fs.exists(STARTUP_PATH) then
-                return false,
-                    "Refusing to overwrite a newly appeared " .. STARTUP_PATH
-            end
-
-            startupCreatedByInstaller = true
-        end
-
+-- The caller chooses an explicit inclusive range. This lets authentication
+-- state be created between ordinary payload deployment and the final Stage-0
+-- write without introducing a second deployment subsystem.
+local function writePayloadRange(payload, firstIndex, lastIndex)
+    for payloadIndex = firstIndex, lastIndex do
+        local payloadFile = payload[payloadIndex]
         local writeSucceeded, writeError = writeTextFile(
             payloadFile.target,
             payloadFile.contents
@@ -1017,6 +1019,131 @@ local function writeSystemPayload(payload)
     end
 
     return true, nil
+end
+
+-- Stage-0 is intentionally excluded from the first deployment range. The
+-- downloaded password/users/config modules must be installed and used to
+-- create a validated users.db before `/startup.lua` can make the installation
+-- bootable. All of this occurs only after the explicit confirmation prompt.
+local function writeSystemPayloadBeforeStage0(payload)
+    if #payload < 2 or payload[#payload].target ~= STARTUP_PATH then
+        return false, "Validated payload has no final Stage-0 entry."
+    end
+
+    return writePayloadRange(payload, 1, #payload - 1)
+end
+
+local function writeStage0Payload(payload)
+    local stage0File = payload[#payload]
+
+    if stage0File == nil or stage0File.target ~= STARTUP_PATH then
+        return false, "Validated payload has no final Stage-0 entry."
+    end
+
+    if fs.exists(STARTUP_PATH) then
+        return false, "Refusing to overwrite a newly appeared " .. STARTUP_PATH
+    end
+
+    -- Preflight proved the path absent, so even a partial write belongs to this
+    -- installer and can be removed safely by the established rollback path.
+    startupCreatedByInstaller = true
+    return writePayloadRange(payload, #payload, #payload)
+end
+
+-- Execute the just-installed shared modules only after user confirmation.
+-- This bootstrap boundary avoids duplicating PBKDF2 or users.db formatting in
+-- install.lua. A verifier is produced in memory, the machine-specific database
+-- is written transactionally, then loaded again through its strict validator
+-- before Stage-0 is installed.
+local function createInitialUserDatabase(ownerUsername, plainPassword, machineID)
+    local operationSucceeded, result, detail = pcall(function()
+        local passwordProgram, passwordLoadError = loadfile(PASSWORD_LIBRARY_PATH)
+
+        if type(passwordProgram) ~= "function" then
+            return false, "Unable to load installed password backend: " ..
+                tostring(passwordLoadError)
+        end
+
+        local passwordModule = passwordProgram()
+
+        if type(passwordModule) ~= "table" or
+            type(passwordModule.createVerifier) ~= "function" or
+            type(passwordModule.validatePassword) ~= "function" then
+            return false, "Installed password backend has an invalid API."
+        end
+
+        local passwordIsValid, passwordError =
+            passwordModule.validatePassword(plainPassword)
+
+        if not passwordIsValid then
+            return false, passwordError
+        end
+
+        local verifier, verifierError = passwordModule.createVerifier(
+            plainPassword,
+            machineID .. ":" .. ownerUsername
+        )
+
+        if verifier == nil then
+            return false, "Unable to create initial password verifier: " ..
+                tostring(verifierError)
+        end
+
+        local usersProgram, usersLoadError = loadfile(USERS_LIBRARY_PATH)
+
+        if type(usersProgram) ~= "function" then
+            return false, "Unable to load installed user database core: " ..
+                tostring(usersLoadError)
+        end
+
+        local usersModule = usersProgram()
+
+        if type(usersModule) ~= "table" or
+            type(usersModule.createInitial) ~= "function" or
+            type(usersModule.write) ~= "function" or
+            type(usersModule.load) ~= "function" then
+            return false, "Installed user database core has an invalid API."
+        end
+
+        local database, databaseError = usersModule.createInitial(
+            ownerUsername,
+            verifier
+        )
+        verifier = nil
+
+        if database == nil then
+            return false, "Unable to build initial users.db: " ..
+                tostring(databaseError)
+        end
+
+        local written, writeError = usersModule.write(
+            database,
+            USERS_DATABASE_PATH
+        )
+        database = nil
+
+        if not written then
+            return false, "Unable to write initial users.db: " ..
+                tostring(writeError)
+        end
+
+        local validated, validationError = usersModule.load(
+            USERS_DATABASE_PATH
+        )
+
+        if validated == nil then
+            return false, "Initial users.db verification failed: " ..
+                tostring(validationError)
+        end
+
+        return true, nil
+    end)
+
+    if not operationSucceeded then
+        return false, tostring(result)
+    end
+
+    return result, detail
 end
 
 -- Persist the CraftOS startup policy required by DICK/OS.
@@ -1208,11 +1335,10 @@ local function printSuccess(hostname, ownerUsername, machineID)
     print("Owner:      " .. ownerUsername)
     print()
     print("Stage-0, init, Recovery, configuration, logging, and shell installed.")
-    print("Interactive session: bootstrap (authentication is not implemented).")
+    print("Owner account: UID 1000 (authenticated admin role metadata).")
+    print("Root account: UID 0 (direct login disabled).")
     print("Reboot or power on the computer to enter DICK/OS.")
-    print()
-    print("Authentication subsystem is not installed yet.")
-    print("The supplied password was not written to disk.")
+    print("The supplied password was stored only as a salted verifier.")
 end
 
 local function runInstaller()
@@ -1336,12 +1462,13 @@ local function runInstaller()
         validateUsername
     )
 
-    confirmPasswordEntry()
+    local ownerPassword = confirmPasswordEntry()
 
     local machineID = generateMachineID(ccID)
     printInstallationSummary(hostname, ownerUsername, machineID)
 
     if not confirmInstallation() then
+        ownerPassword = nil
         print()
         print("Installation cancelled.")
         return
@@ -1351,6 +1478,7 @@ local function runInstaller()
     -- prevents an existing installation or startup program from being
     -- overwritten if filesystem state changed during setup.
     if fs.exists(INSTALL_PATH) then
+        ownerPassword = nil
         print()
         fail("The /dickos path appeared before deployment could begin.")
         print("No files were overwritten.")
@@ -1360,6 +1488,7 @@ local function runInstaller()
     startupConflict = findStartupConflict()
 
     if startupConflict ~= nil then
+        ownerPassword = nil
         print()
         fail(startupConflict .. " appeared before deployment could begin.")
         print("No files were overwritten.")
@@ -1387,7 +1516,7 @@ local function runInstaller()
         return
     end
 
-    local payloadSucceeded, payloadWriteError = writeSystemPayload(
+    local payloadSucceeded, payloadWriteError = writeSystemPayloadBeforeStage0(
         installationPayload
     )
 
@@ -1395,6 +1524,34 @@ local function runInstaller()
         reportDeploymentFailure(
             "Unable to install the bootstrap program payload.",
             payloadWriteError
+        )
+        return
+    end
+
+
+    local usersSucceeded, usersError = createInitialUserDatabase(
+        ownerUsername,
+        ownerPassword,
+        machineID
+    )
+    ownerPassword = nil
+
+    if not usersSucceeded then
+        reportDeploymentFailure(
+            "Unable to create the initial authenticated owner.",
+            usersError
+        )
+        return
+    end
+
+    local stage0Succeeded, stage0Error = writeStage0Payload(
+        installationPayload
+    )
+
+    if not stage0Succeeded then
+        reportDeploymentFailure(
+            "Unable to install Stage-0 after authentication state.",
+            stage0Error
         )
         return
     end
